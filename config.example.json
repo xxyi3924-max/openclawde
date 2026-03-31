@@ -1,0 +1,35 @@
+{
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "anthropic_api_key": "sk-ant-YOUR_KEY",
+  "openai_api_key": "sk-proj-YOUR_KEY",
+  "minimax_api_key": "sk-cp-YOUR_KEY",
+  "telegram_token": "YOUR_BOT_TOKEN",
+  "allow_from_chat_ids": [123456789],
+  "thinking_budget": 5000,
+  "poll_interval": 1,
+  "max_history": 50,
+  "max_loop_pairs": 12,
+  "max_context_messages": 30,
+  "fallback_model": "gpt-4o-mini",
+  "fallback_cooldown_seconds": 60,
+  "telegram_proxy": null,
+
+  "_comment_phase2": "Permission tiers — added in Phase 2",
+  "auto_approve_level": "LOW",
+
+  "_comment_phase4": "Task tracker — added in Phase 4",
+  "task_db": "memory/tasks.db",
+
+  "_comment_phase5": "Context compaction — added in Phase 5",
+  "compaction_threshold_messages": 40,
+  "compaction_keep_recent": 10,
+  "compaction_model": "claude-haiku-4-5-20251001",
+
+  "_comment_phase6": "autoDream memory consolidation — added in Phase 6",
+  "dream_enabled": true,
+  "dream_interval_hours": 24,
+  "dream_min_sessions": 5,
+  "dream_model": "claude-haiku-4-5-20251001",
+  "dream_memory_max_lines": 200
+}

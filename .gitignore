@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Secrets / config
+config.json
+mcp.json
+
+# Runtime state
+memory/conversation.json
+memory/tasks.db
+memory/token_usage.jsonl
+memory/run.log
+memory/tool_calls.log
+memory/MEMORY.md
+memory/notes/
+memory/agent_output/
+workspace/
+
+# macOS
+.DS_Store

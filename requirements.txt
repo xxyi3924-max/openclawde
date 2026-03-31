@@ -1,0 +1,8 @@
+anthropic
+openai
+requests
+beautifulsoup4
+duckduckgo-search
+flask
+python-frontmatter  # skill .md frontmatter parsing (falls back to regex if missing)
+mcp                 # MCP server support (optional — agent works without it)
