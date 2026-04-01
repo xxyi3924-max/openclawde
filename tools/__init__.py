@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import logging
+import queue
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -18,11 +19,11 @@ __all__ = [
     "_continuation", "_dynamic_fns", "_dynamic_defs",
     "RiskTier",
     "_planning_mode", "set_planning_mode",
+    "_self_task_queue",
 ]
 
 # ------------------------------------------------------------------
-# Planning mode flag — set True to filter MEDIUM/HIGH tools from API
-# and block non-planning_allowed tool calls at dispatch time.
+# Planning mode flag
 # ------------------------------------------------------------------
 _planning_mode: bool = False
 
@@ -32,8 +33,9 @@ def set_planning_mode(enabled: bool):
     _planning_mode = enabled
     print(f"[Tools] Planning mode {'ON' if enabled else 'OFF'}")
 
+
 # ------------------------------------------------------------------
-# Continuation state (written directly by agent.py: tool_module._continuation = "...")
+# Continuation state (written by agent.py: tool_module._continuation = "...")
 # ------------------------------------------------------------------
 _continuation: str | None = None
 
@@ -43,6 +45,14 @@ def get_continuation() -> str | None:
     val = _continuation
     _continuation = None
     return val
+
+
+# ------------------------------------------------------------------
+# Self-task queue — agent queues its own follow-up work.
+# main.py drains this after each turn and auto-dispatches without
+# waiting for a human message.
+# ------------------------------------------------------------------
+_self_task_queue: queue.Queue = queue.Queue()
 
 
 # ------------------------------------------------------------------
@@ -464,15 +474,17 @@ _BUILTIN_TOOL_DEFS: list[ToolDef] = [
     ToolDef(
         name="run_agent",
         description=(
-            "Spawn a sub-agent to handle a self-contained task in parallel. "
-            "Use background=true to run async (returns immediately). "
-            "Use background=false (default) to run sync and get the result."
+            "Spawn a specialized sub-agent. "
+            "agent_type: 'explore' (read-only, haiku), 'plan' (planning only), "
+            "'verify' (runs tests), 'worker' (full tools, default). "
+            "background=true returns immediately; background=false blocks for result."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "description": {"type": "string", "description": "Short description of what the sub-agent will do"},
-                "prompt": {"type": "string", "description": "Full task prompt for the sub-agent"},
+                "description": {"type": "string", "description": "3-5 word task description"},
+                "prompt": {"type": "string", "description": "Full self-contained task prompt — include all needed context"},
+                "agent_type": {"type": "string", "enum": ["worker", "explore", "plan", "verify"], "description": "Agent type (default: worker)"},
                 "background": {"type": "boolean", "description": "Run async in background (default: false)"},
             },
             "required": ["description", "prompt"],
@@ -539,7 +551,110 @@ _BUILTIN_TOOL_DEFS: list[ToolDef] = [
         risk=RiskTier.LOW,
         planning_allowed=True,
     ),
+    # ----------------------------------------------------------------
+    # Autonomy tools
+    # ----------------------------------------------------------------
+    ToolDef(
+        name="exit_plan_mode",
+        description=(
+            "Exit planning mode and immediately continue with full execution tools. "
+            "Call this after presenting your plan — pass the plan text as 'plan'. "
+            "Do NOT wait for human /execute — call this tool to proceed autonomously."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "plan": {"type": "string", "description": "The plan you are about to execute"},
+            },
+            "required": ["plan"],
+        },
+        fn=lambda plan="": _exit_plan_mode(plan),
+        risk=RiskTier.LOW,
+        planning_allowed=True,  # Available IN plan mode — that's the whole point
+    ),
+    ToolDef(
+        name="queue_self_task",
+        description=(
+            "Schedule a follow-up task for yourself to work on after the current turn. "
+            "Use this to chain work autonomously without waiting for the user. "
+            "The task will be dispatched automatically in the next turn."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Full task prompt for the follow-up turn"},
+                "context": {"type": "string", "description": "Additional context to prepend (optional)"},
+            },
+            "required": ["prompt"],
+        },
+        fn=lambda prompt="", context="": _queue_self_task(prompt, context),
+        risk=RiskTier.LOW,
+        planning_allowed=True,
+    ),
+    ToolDef(
+        name="set_goal",
+        description=(
+            "Set a persistent autonomous goal. The agent will pursue this goal across sessions, "
+            "automatically starting work on it without needing a human message. "
+            "Goal persists until explicitly cleared with set_goal(goal='')."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "The goal to pursue autonomously. Empty string to clear."},
+                "notes": {"type": "string", "description": "Additional context or constraints for pursuing this goal"},
+            },
+            "required": ["goal"],
+        },
+        fn=lambda goal="", notes="": _set_goal(goal, notes),
+        risk=RiskTier.LOW,
+        planning_allowed=True,
+    ),
 ]
+
+
+# ------------------------------------------------------------------
+# Autonomy tool implementations (kept here to access module-level state)
+# ------------------------------------------------------------------
+
+def _exit_plan_mode(plan: str) -> str:
+    set_planning_mode(False)
+    return (
+        "[Plan mode exited. Full execution tools now available. Proceed with implementation.]\n\n"
+        f"Plan committed:\n{plan}"
+    )
+
+
+def _queue_self_task(prompt: str, context: str = "") -> str:
+    full = f"{context}\n\n{prompt}".strip() if context else prompt
+    _self_task_queue.put(full)
+    return f"[Self-task queued] Will execute after this turn: {prompt[:100]}"
+
+
+_GOAL_FILE = Path(__file__).parent.parent / "memory" / "goal.json"
+
+
+def _set_goal(goal: str, notes: str = "") -> str:
+    if not goal:
+        if _GOAL_FILE.exists():
+            _GOAL_FILE.unlink()
+        return "[Goal cleared. Agent will no longer auto-start work on session start.]"
+    _GOAL_FILE.parent.mkdir(exist_ok=True)
+    _GOAL_FILE.write_text(
+        json.dumps({"goal": goal, "notes": notes, "set_at": datetime.now().isoformat()}, indent=2),
+        encoding="utf-8",
+    )
+    return f"[Goal set] '{goal}'. Will auto-pursue on session start."
+
+
+def load_goal() -> dict | None:
+    """Called by main.py on startup to check for a persistent goal."""
+    if _GOAL_FILE.exists():
+        try:
+            return json.loads(_GOAL_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return None
 
 _BUILTIN_NAMES: set[str] = {td.name for td in _BUILTIN_TOOL_DEFS}
 
@@ -705,26 +820,49 @@ def _requires_confirm(risk: RiskTier, auto_approve_level: str) -> bool:
     return order[risk] >= threshold
 
 
-def execute(name: str, inputs: dict, send_update=None, permission_fn=None) -> str:
+def execute(name: str, inputs: dict, send_update=None, permission_fn=None, agent_id: str = "") -> str:
     """
     Execute a tool by name.
 
     permission_fn(name, inputs, risk_tier) — called for ops that need user approval.
     It must return "approved" or "denied". If not provided, all ops are auto-approved.
+    agent_id — passed to hooks for context.
     """
     try:
+        import hooks as _hooks
+
         tool = _TOOL_REGISTRY.get(name)
 
         # Planning mode: block non-planning_allowed tools
         if _planning_mode and tool and not tool.planning_allowed:
             return (
                 f"[BLOCKED — Planning Mode] '{name}' is not available while planning. "
-                "Present your plan as text. Send /execute to switch to execution mode."
+                "Call exit_plan_mode(plan) to proceed with execution autonomously, "
+                "or the user can send /execute."
             )
 
-        # Permission gate: ask user for HIGH/MEDIUM ops if permission_fn provided
-        if tool and permission_fn:
-            # _auto_approve_level is injected by the agent via config
+        # PreToolUse hook — can approve, deny, or rewrite inputs
+        pre = _hooks.fire("PreToolUse", {
+            "event": "PreToolUse",
+            "tool_name": name,
+            "inputs": inputs,
+            "agent_id": agent_id,
+        }, matcher=name)
+
+        if not pre.should_continue:
+            return f"[Blocked by hook] {pre.stop_reason}"
+
+        # Hook can override permission decision
+        hook_decision = pre.decision  # "approve" | "deny" | ""
+
+        # Rewrite inputs if hook asked for it
+        if pre.updated_inputs:
+            inputs = {**inputs, **pre.updated_inputs}
+
+        # Permission gate
+        if hook_decision == "deny":
+            return f"[Denied by hook] Tool '{name}' was denied by a PreToolUse hook."
+        elif hook_decision != "approve" and tool and permission_fn:
             auto_level = getattr(permission_fn, "_auto_approve_level", "LOW")
             if _requires_confirm(tool.risk, auto_level):
                 decision = permission_fn(name, inputs, tool.risk)
@@ -732,7 +870,22 @@ def execute(name: str, inputs: dict, send_update=None, permission_fn=None) -> st
                     return f"[Denied] User did not approve '{name}'."
 
         result = _dispatch(name, inputs, send_update)
+
+        # Append hook additional_context to result if provided
+        if pre.additional_context:
+            result = f"{result}\n\n[Hook context] {pre.additional_context}"
+
         _log_call(name, inputs, result)
+
+        # PostToolUse hook (async by default — doesn't block)
+        _hooks.fire("PostToolUse", {
+            "event": "PostToolUse",
+            "tool_name": name,
+            "inputs": inputs,
+            "result": result[:500],
+            "agent_id": agent_id,
+        }, matcher=name)
+
         return result
     except PermissionError as e:
         _log_call(name, inputs, f"[Permission denied] {e}")
@@ -788,7 +941,9 @@ def _dispatch(name: str, inputs: dict, send_update=None) -> str:
             return skill_tool.invoke_skill(inputs["name"], inputs.get("args", ""))
         case "run_agent":
             return agent_tool.run_agent(
-                inputs["description"], inputs["prompt"], inputs.get("background", False)
+                inputs["description"], inputs["prompt"],
+                inputs.get("background", False),
+                inputs.get("agent_type", "worker")
             )
         case "get_agent_output":
             return agent_tool.get_agent_output(inputs["task_id"])
@@ -806,6 +961,12 @@ def _dispatch(name: str, inputs: dict, send_update=None) -> str:
             )
         case "block_task":
             return task_tools.block_task(inputs["task_id"], inputs["blocked_by_id"])
+        case "exit_plan_mode":
+            return _exit_plan_mode(inputs.get("plan", ""))
+        case "queue_self_task":
+            return _queue_self_task(inputs.get("prompt", ""), inputs.get("context", ""))
+        case "set_goal":
+            return _set_goal(inputs.get("goal", ""), inputs.get("notes", ""))
         case _:
             if name.startswith("mcp__"):
                 try:

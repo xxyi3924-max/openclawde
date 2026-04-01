@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "python hooks/load_env.py",
+        "timeout": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_shell",
+        "command": "python hooks/audit_shell.py",
+        "timeout": 3
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "run_shell",
+        "command": "python hooks/log_commands.py",
+        "async": true
+      }
+    ],
+    "Notification": [
+      {
+        "command": "python hooks/forward_to_slack.py",
+        "async": true
+      }
+    ]
+  }
+}

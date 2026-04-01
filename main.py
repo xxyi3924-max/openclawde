@@ -7,6 +7,7 @@ from pathlib import Path
 
 import tools as tool_module
 import coordinator as coord_module
+import hooks as hooks_module
 
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
@@ -14,6 +15,7 @@ TOKEN_LOG = BASE_DIR / "memory" / "token_usage.jsonl"
 
 _current_task: threading.Thread | None = None
 _task_lock = threading.Lock()
+_last_chat_id: int = 0
 
 
 def _token_summary() -> str:
@@ -60,8 +62,26 @@ def load_config() -> dict:
         return json.load(f)
 
 
+def _do_respond(agent, tg, text: str, chat_id: int) -> str:
+    """Single agent.respond() call with typing indicator. Returns response."""
+    stop_typing = threading.Event()
+    threading.Thread(
+        target=tg.start_typing_loop, args=(chat_id, stop_typing), daemon=True
+    ).start()
+    try:
+        return agent.respond(text)
+    except Exception as e:
+        from agent import _log
+        _log(f"[agent error] {e}")
+        return f"Sorry, something went wrong: {e}"
+    finally:
+        stop_typing.set()
+
+
 def run_agent(agent, tg, text: str, chat_id: int):
-    """Process one message. Runs in a background thread."""
+    """Process one message — runs in a background thread."""
+    global _last_chat_id
+    _last_chat_id = chat_id
     agent._current_chat_id = chat_id
     tool_module.reset_cancel()
 
@@ -70,56 +90,40 @@ def run_agent(agent, tg, text: str, chat_id: int):
 
     agent.send_update = send_update
 
-    stop_typing = threading.Event()
-    typing_thread = threading.Thread(
-        target=tg.start_typing_loop, args=(chat_id, stop_typing), daemon=True
-    )
-    typing_thread.start()
+    from agent import _log
 
-    try:
-        response = agent.respond(text)
-    except Exception as e:
-        response = f"Sorry, something went wrong: {e}"
-        from agent import _log
-        _log(f"[agent error] {e}")
-    finally:
-        stop_typing.set()
+    response = _do_respond(agent, tg, text, chat_id)
 
     if tool_module.is_cancelled():
-        from agent import _log
         _log("[Agent] Loop cancelled — dropping response.")
         return
 
-    from agent import _log
     _log(f"[Response] {response[:300]}")
     tg.send_chunked(chat_id, response)
 
-    # Phase 6: trigger dream check after task completes
     agent.dream.on_task_complete()
 
-    # Auto-continue
+    # Auto-continue: [[CONTINUE]] tokens + self-queued tasks both drain here
     while not tool_module.is_cancelled():
         next_step = tool_module.get_continuation()
+
+        # Also drain self-task queue if no [[CONTINUE]] pending
         if not next_step:
-            break
-        print(f"[Auto-continue] {next_step}")
-        stop_typing2 = threading.Event()
-        threading.Thread(
-            target=tg.start_typing_loop, args=(chat_id, stop_typing2), daemon=True
-        ).start()
-        try:
-            response = agent.respond(next_step)
-        except Exception as e:
-            response = f"Error during continuation: {e}"
-            print(f"[agent error] {e}")
-        finally:
-            stop_typing2.set()
+            try:
+                next_step = tool_module._self_task_queue.get_nowait()
+                _log(f"[Self-task] {next_step[:80]}")
+            except Exception:
+                break
+
+        response = _do_respond(agent, tg, next_step, chat_id)
 
         if tool_module.is_cancelled():
             break
 
-        print(f"[Agent] {response[:200]}")
+        _log(f"[Agent] {response[:200]}")
         tg.send_chunked(chat_id, response)
+
+        agent.dream.on_task_complete()
 
 
 def dispatch(agent, tg, text: str, chat_id: int):
@@ -164,16 +168,37 @@ def main():
 
     agent.dream.on_session_start()
 
+    # Fire SessionStart hooks
+    hooks_module.fire("SessionStart", {"event": "SessionStart"})
+
     with open(RUN_LOG, "a", encoding="utf-8") as f:
         from datetime import datetime
         f.write(f"\n{'='*60}\n")
         f.write(f"SESSION START {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"  Provider : {config.get('provider')} / {config.get('model')}\n")
+        f.write(f"  Autonomous: {config.get('autonomous', False)}\n")
         f.write(f"{'='*60}\n")
 
-    print(f"[Fake_openclaw_3] Running")
-    print(f"  Provider : {config.get('provider')} / {config.get('model')}")
-    print(f"  Workspace: {BASE_DIR / 'workspace'}")
+    print(f"[openclawde] Running")
+    print(f"  Provider  : {config.get('provider')} / {config.get('model')}")
+    print(f"  Workspace : {BASE_DIR / 'workspace'}")
+    print(f"  Autonomous: {config.get('autonomous', False)}")
+
+    # Auto-wake: load persistent goal and prime the self-task queue
+    goal_data = tool_module.load_goal()
+    if goal_data:
+        goal_txt = goal_data["goal"]
+        notes_txt = goal_data.get("notes", "")
+        print(f"  Goal      : {goal_txt[:80]}")
+        wake_prompt = (
+            f"Autonomous session start. Your persistent goal:\n\n{goal_txt}"
+            + (f"\n\nContext: {notes_txt}" if notes_txt else "")
+            + "\n\nCheck your task list, assess progress, and continue working toward the goal."
+        )
+        tool_module._self_task_queue.put(wake_prompt)
+
+    if config.get("autonomous", False):
+        print("  [AUTONOMOUS MODE] Agent will work without human confirmation.")
     print("Send a message to your bot on Telegram to start. Ctrl+C to stop.\n")
 
     while True:

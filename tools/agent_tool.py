@@ -57,7 +57,32 @@ def _filter_tools_for_subagent(tools: list[dict]) -> list[dict]:
     return [t for t in tools if t["name"] not in _SUB_AGENT_BLOCKED_TOOLS]
 
 
-def run_agent(description: str, prompt: str, background: bool = False) -> str:
+def _apply_agent_type(sub, agent_type_name: str):
+    """Apply a named agent type definition to a sub-agent instance."""
+    try:
+        import agents as _agents_mod
+        at = _agents_mod.get_manager().get(agent_type_name)
+        if at:
+            sub._agent_type_name = at.name
+            sub._agent_type_system_prompt = at.system_prompt
+            if at.model:
+                sub._active_model = at.model
+                sub.model = at.model
+            # Build restricted tool list from type's disallowed list + coordinator-only block
+            import tools as _tool_module
+            base = _filter_tools_for_subagent(list(_tool_module.TOOL_DEFINITIONS))
+            if at.disallowed_tools:
+                blocked = set(at.disallowed_tools)
+                sub._sub_agent_tools = [t for t in base if t["name"] not in blocked]
+            else:
+                sub._sub_agent_tools = base
+            return True
+    except Exception as e:
+        print(f"[AgentTool] Could not apply agent type '{agent_type_name}': {e}")
+    return False
+
+
+def run_agent(description: str, prompt: str, background: bool = False, agent_type: str = "worker") -> str:
     if _agent_factory is None:
         return "[Agent tool not initialized]"
 
@@ -69,9 +94,11 @@ def run_agent(description: str, prompt: str, background: bool = False) -> str:
         sub._agent_id = agent_id
         entry = agent_registry.register(agent_id, task_id=None, description=description)
 
-        # Restrict tool set so sub-agents can't spawn further agents
-        import tools as _tool_module
-        sub._sub_agent_tools = _filter_tools_for_subagent(list(_tool_module.TOOL_DEFINITIONS))
+        # Apply agent type (sets system prompt, model, tool restrictions)
+        if not _apply_agent_type(sub, agent_type):
+            # Fallback: just restrict coordinator tools
+            import tools as _tool_module
+            sub._sub_agent_tools = _filter_tools_for_subagent(list(_tool_module.TOOL_DEFINITIONS))
 
         try:
             result = sub.respond(prompt)
@@ -102,9 +129,10 @@ def run_agent(description: str, prompt: str, background: bool = False) -> str:
         sub = _agent_factory()
         sub._agent_id = agent_id
 
-        # Restrict tool set
-        import tools as _tool_module
-        sub._sub_agent_tools = _filter_tools_for_subagent(list(_tool_module.TOOL_DEFINITIONS))
+        # Apply agent type
+        if not _apply_agent_type(sub, agent_type):
+            import tools as _tool_module
+            sub._sub_agent_tools = _filter_tools_for_subagent(list(_tool_module.TOOL_DEFINITIONS))
 
         def _write(msg: str):
             if output_file:

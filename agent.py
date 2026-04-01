@@ -12,10 +12,13 @@ from openai import OpenAI, RateLimitError as OpenAIRateLimitError
 
 import sandbox
 import tools as tool_module
+import agents as agent_types_module
+import hooks as hooks_module
 from coordinator import get_coordinator_system_prompt, is_coordinator_mode
 from memory.history import ConversationHistory
 from memory.tasks import TaskStore
 from memory.token_log import log_tokens
+from memory.token_tracker import TokenTracker
 from memory.dream import DreamConsolidator
 from tools import agent_registry
 
@@ -98,17 +101,30 @@ Notes are loaded automatically next session — use them.
 Call list_files() once at task start. All work goes in workspace/. If files already exist, continue from them — never restart.
 Before writing new code, call list_tools() — a ready-made tool may exist in workspace/tools/.
 
+## Autonomy — work independently
+You are an autonomous agent. Minimize human interaction.
+
+- **Never stop mid-task to ask for confirmation.** If you can infer what to do, do it.
+- **Use [[CONTINUE]] freely** for multi-step work. Your work resumes automatically.
+- **Use queue_self_task()** to schedule follow-up work for yourself. It runs automatically after the current turn — no human needed.
+- **Use exit_plan_mode(plan)** to leave planning mode yourself. Do NOT wait for `/execute`.
+- **Use set_goal(goal)** to set a persistent goal you'll work toward across sessions.
+- After completing a task, proactively check: is there an obvious next step? If yes, queue_self_task() it.
+- Only involve the human when: credentials are missing, the requirement is genuinely ambiguous, or you've hit a hard blocker after trying alternatives.
+
+## Agent types
+Spawn specialized sub-agents with run_agent(agent_type="explore"|"plan"|"verify"|"worker"):
+- explore — read-only, haiku model, maps codebase fast
+- plan    — produces a concrete implementation plan, no execution
+- verify  — runs tests and gives PASS/FAIL verdict
+- worker  — full tool set, autonomous implementation
+
 ## Skills
-Skills are reusable prompt macros. Invoke them with the invoke_skill tool.
-User can also type /skill_name [args] in Telegram to expand a skill directly.
-$ARGUMENTS in the skill template is replaced with the args string.
-Available skills are listed in the invoke_skill tool description.
-Fork-context skills run in a sub-agent; inline skills expand into your conversation.
+Skills are reusable prompt macros. Invoke with invoke_skill or /skill_name in Telegram.
 
 ## Sub-agents
 Use run_agent(description, prompt, background) to delegate self-contained tasks.
-Background agents run concurrently — use get_agent_output(task_id) to read their results.
-Sub-agents have no shared history with you — pass all needed context in the prompt.
+Background agents run concurrently — use send_to_agent() to direct them mid-run.
 
 ## Silent replies
 When you have nothing to say (e.g. a tool already sent the update, or the task is fully self-contained), respond with ONLY: [[SILENT]]
@@ -138,11 +154,19 @@ class Agent:
         self._current_chat_id: int = 0
 
         # Multi-agent: set when this Agent is running as a sub-agent/worker
-        # agent_registry.py uses this ID for message passing + abort
         self._agent_id: str | None = None
         # When set, overrides TOOL_DEFINITIONS for this agent instance
-        # (used by agent_tool.py to give sub-agents a restricted tool set)
         self._sub_agent_tools: list[dict] | None = None
+
+        # Token-aware compaction tracker
+        self.token_tracker = TokenTracker()
+
+        # Autonomous mode: skip all permission confirmation, auto-approve everything
+        self._autonomous = config.get("autonomous", False)
+
+        # Agent type (set when spawned as explore/plan/verify/worker)
+        self._agent_type_name: str | None = None
+        self._agent_type_system_prompt: str | None = None
 
         # Phase 4: task tracker
         task_db = Path(__file__).parent / config.get("task_db", "memory/tasks.db")
@@ -320,8 +344,10 @@ class Agent:
     # ------------------------------------------------------------------
 
     def _build_cached_system(self) -> list[dict]:
-        # Coordinator mode overrides the base system prompt
-        if is_coordinator_mode():
+        # Priority: agent type > coordinator mode > default
+        if self._agent_type_system_prompt:
+            base = self._agent_type_system_prompt
+        elif is_coordinator_mode():
             base = get_coordinator_system_prompt()
         else:
             base = SYSTEM_PROMPT
@@ -366,9 +392,15 @@ class Agent:
     def _make_permission_fn(self, chat_id: int):
         """
         Returns a permission_fn closure that asks the user via Telegram inline keyboard.
-        The closure blocks until the user approves or denies (or times out).
-        Falls back to auto-approve if no tg handler available.
+        In autonomous mode, always approves without asking.
         """
+        # Autonomous mode or sub-agents always auto-approve
+        if self._autonomous or self._agent_id is not None:
+            def _auto(name, inputs, risk):
+                return "approved"
+            _auto._auto_approve_level = "HIGH"
+            return _auto
+
         auto_level = self.config.get("auto_approve_level", "LOW")
         tg = getattr(self, "_tg", None)
         callback_queue = getattr(self, "_callback_queue", None)
@@ -510,6 +542,9 @@ class Agent:
 
             log_tokens(TOKEN_LOG, iterations, resp.stop_reason, resp.usage, messages)
 
+            # Token tracker update
+            self.token_tracker.update(resp.usage)
+
             # Report token usage to agent registry for coordinator progress view
             if self._agent_id and resp.usage:
                 agent_registry.record_tokens(
@@ -517,6 +552,43 @@ class Agent:
                     input_tokens=resp.usage.input_tokens,
                     output_tokens=resp.usage.output_tokens,
                 )
+
+            # Warn if approaching context limit
+            if self.token_tracker.should_warn(self._active_model):
+                self.token_tracker._warned = True
+                warn_msg = f"⚠️ {self.token_tracker.status_line(self._active_model)} — will auto-compact soon."
+                _log(f"[Context] {warn_msg}")
+                if self.send_update:
+                    self.send_update(warn_msg)
+
+            # Auto-compact if over threshold
+            if self.token_tracker.should_compact(self._active_model):
+                _log(f"[Compact] Token threshold reached ({self.token_tracker.status_line(self._active_model)}). Auto-compacting.")
+                try:
+                    threshold = self.config.get("compaction_threshold_messages", 40)
+                    keep_recent = self.config.get("compaction_keep_recent", 10)
+                    summary = self.history.compact(self._summarize_history, keep_recent)
+                    if summary:
+                        _log(f"[Compact] Done. Summary: {len(summary)} chars.")
+                        self.token_tracker.reset()
+                        # Rebuild message list from compacted history
+                        raw = [
+                            {"role": m["role"], "content": m["content"]}
+                            for m in self.history.get_recent(self.config.get("max_context_messages", 20))
+                            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
+                        ]
+                        messages = []
+                        for msg in raw:
+                            if messages and messages[-1]["role"] == msg["role"]:
+                                messages[-1]["content"] += "\n\n" + msg["content"]
+                            else:
+                                messages.append(dict(msg))
+                        initial_msg_count = len(messages)
+                except Exception as e:
+                    _log(f"[Compact] Failed: {e}")
+                    self.token_tracker.record_failure()
+                    if self.token_tracker.circuit_open:
+                        _log("[Compact] Circuit open — compaction disabled for this session.")
 
             if resp.stop_reason == "end_turn":
                 parts = [b.text for b in resp.content if hasattr(b, "text") and b.type == "text"]
@@ -543,10 +615,11 @@ class Agent:
                         tool_calls_to_exec.append(block)
 
                 tool_results = []
+                _aid = self._agent_id or ""
                 if len(tool_calls_to_exec) > 1:
                     with concurrent.futures.ThreadPoolExecutor() as executor:
                         futures = {
-                            executor.submit(tool_module.execute, blk.name, blk.input, self.send_update, permission_fn): blk
+                            executor.submit(tool_module.execute, blk.name, blk.input, self.send_update, permission_fn, _aid): blk
                             for blk in tool_calls_to_exec
                         }
                         results_map = {}
@@ -558,7 +631,7 @@ class Agent:
                         tool_results.append({"type": "tool_result", "tool_use_id": blk.id, "content": result})
                 else:
                     for blk in tool_calls_to_exec:
-                        result = str(tool_module.execute(blk.name, blk.input, self.send_update, permission_fn))
+                        result = str(tool_module.execute(blk.name, blk.input, self.send_update, permission_fn, _aid))
                         _log(f"[Result] {result[:200]}")
                         tool_results.append({"type": "tool_result", "tool_use_id": blk.id, "content": result})
 
