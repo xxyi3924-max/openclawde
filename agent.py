@@ -816,12 +816,24 @@ class Agent:
             "Be dense — this replaces the full history.\n\n"
             + "\n".join(lines)
         )
+        compaction_model = self.config.get(
+            "compaction_model",
+            "claude-haiku-4-5-20251001" if self.provider == "anthropic" else self._active_model,
+        )
         try:
-            resp = self.client.messages.create(
-                model=self.config.get("compaction_model", "claude-haiku-4-5-20251001"),
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return resp.content[0].text
+            if self.provider == "anthropic":
+                resp = self.client.messages.create(
+                    model=compaction_model,
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return resp.content[0].text
+            else:
+                resp = self.client.chat.completions.create(
+                    model=compaction_model,
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return resp.choices[0].message.content or ""
         except Exception as e:
             return f"[Summary unavailable: {e}]"
