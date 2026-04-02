@@ -59,13 +59,25 @@ class TokenTracker:
     _warned: bool = field(default=False, repr=False)
 
     def update(self, usage) -> None:
-        """Call after every API response with the usage object."""
+        """Call after every API response with the usage object.
+
+        Handles both Anthropic (input_tokens/output_tokens) and
+        OpenAI (prompt_tokens/completion_tokens) field naming.
+        """
         if usage is None:
             return
-        if hasattr(usage, "input_tokens") and usage.input_tokens:
-            self.input_tokens = usage.input_tokens
-        if hasattr(usage, "output_tokens") and usage.output_tokens:
-            self.output_tokens += usage.output_tokens
+        # Anthropic naming
+        inp = getattr(usage, "input_tokens", None)
+        out = getattr(usage, "output_tokens", None)
+        # OpenAI naming
+        if inp is None:
+            inp = getattr(usage, "prompt_tokens", None)
+        if out is None:
+            out = getattr(usage, "completion_tokens", None)
+        if inp:
+            self.input_tokens = inp   # latest value, not cumulative
+        if out:
+            self.output_tokens += out  # cumulative
 
     def reset(self) -> None:
         """Call after successful compaction to reset counters."""

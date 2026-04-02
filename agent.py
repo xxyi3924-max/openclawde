@@ -20,6 +20,7 @@ from coordinator import get_coordinator_system_prompt, is_coordinator_mode
 from memory.token_log import log_tokens
 from memory.dream import DreamConsolidator
 from session import Session
+from thinking import get_thinking_kwargs, extract_thinking, should_strip_thinking_from_history
 from tools import agent_registry
 
 MEMORY_DIR = Path(__file__).parent / "memory"
@@ -192,12 +193,15 @@ class Agent:
         if self.provider == "anthropic":
             api_key = config.get("anthropic_api_key") or None
             self.client = Anthropic(api_key=api_key) if api_key else Anthropic()
+            self._base_url = ""
         elif self.provider == "minimax":
             api_key = config.get("minimax_api_key") or None
-            self.client = OpenAI(api_key=api_key, base_url="https://api.minimax.io/v1")
+            self._base_url = config.get("openai_base_url", "https://api.minimax.io/v1")
+            self.client = OpenAI(api_key=api_key, base_url=self._base_url)
         else:
             api_key = config.get("openai_api_key") or None
-            self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
+            self._base_url = config.get("openai_base_url", "")
+            self.client = OpenAI(api_key=api_key, base_url=self._base_url or None) if api_key else OpenAI()
 
         # Phase 6: autoDream memory consolidation (needs self.client)
         self.dream = DreamConsolidator(config, self.client)
@@ -461,6 +465,24 @@ class Agent:
 
         permission_fn._auto_approve_level = auto_level
         return permission_fn
+
+    def _prune_old_context_openai(self, messages: list, keep_recent: int = 3) -> list:
+        """Truncate large tool-result content in old OpenAI-format messages.
+
+        OpenAI tool results have role="tool" with a plain string content field,
+        unlike Anthropic's list-of-blocks format handled by _prune_old_context.
+        """
+        tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+        to_prune = tool_indices[:-keep_recent] if len(tool_indices) > keep_recent else []
+        pruned = 0
+        for idx in to_prune:
+            content = messages[idx].get("content", "")
+            if isinstance(content, str) and len(content) > 300:
+                messages[idx] = {**messages[idx], "content": content[:300] + " …[pruned]"}
+                pruned += 1
+        if pruned:
+            _log(f"[Prune/OAI] tool_results={pruned}")
+        return messages
 
     def _prune_old_context(self, messages: list, keep_recent: int = 3) -> list:
         tool_result_indices = [
@@ -738,11 +760,17 @@ class Agent:
 
     def _openai_loop(self, permission_fn=None) -> tuple[str, str]:
         ctx = self.config.get("max_context_messages", 20)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for m in self.history.get_recent(ctx):
-            if isinstance(m.get("content"), str):
-                messages.append({"role": m["role"], "content": m["content"]})
 
+        def _rebuild_messages() -> list:
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+            for m in self.history.get_recent(ctx):
+                if isinstance(m.get("content"), str):
+                    msgs.append({"role": m["role"], "content": m["content"]})
+            return msgs
+
+        messages = _rebuild_messages()
+
+        # Respect planning mode and agent-type tool restrictions (same as Anthropic loop)
         openai_tools = [
             {
                 "type": "function",
@@ -752,43 +780,164 @@ class Agent:
                     "parameters": t["input_schema"],
                 },
             }
-            for t in tool_module.TOOL_DEFINITIONS
+            for t in self._build_cached_tools()
         ]
 
         iterations = 0
+        state = TurnState()
         if self._agent_id is None:
             max_turns = self.config.get("max_iterations")
         else:
             max_turns = self._max_turns or self.config.get("max_iterations", _SUBAGENT_DEFAULT_MAX_TURNS)
 
+        thinking_budget = self.config.get("thinking_budget", 0)
+        thinking_kwargs = get_thinking_kwargs(self.provider, self._active_model, self._base_url, thinking_budget)
+        strip_thinking = should_strip_thinking_from_history(self.provider, self._active_model, self._base_url)
+        _thinking_unsupported = False  # set True after a 400 on thinking kwargs
+
         while max_turns is None or iterations < max_turns:
             if tool_module.is_cancelled():
                 return ("Interrupted.", "interrupted")
 
-            resp = self.client.chat.completions.create(
+            messages = self._prune_old_context_openai(messages)
+
+            create_kwargs = dict(
                 model=self._active_model,
                 messages=messages,
                 tools=openai_tools,
                 tool_choice="required" if iterations == 0 else "auto",
             )
+            if thinking_kwargs and not _thinking_unsupported:
+                create_kwargs.update(thinking_kwargs)
+
+            try:
+                resp = self.client.chat.completions.create(**create_kwargs)
+            except Exception as e:
+                err = str(e)
+                # Provider rejected thinking param (e.g. real OpenAI 400 "unknown_parameter")
+                if thinking_kwargs and not _thinking_unsupported and ("unknown_parameter" in err or "unknown field" in err.lower() or "400" in err):
+                    _log(f"[Thinking] Provider rejected thinking param, disabling: {err[:120]}")
+                    _thinking_unsupported = True
+                    create_kwargs.pop("extra_body", None)
+                    create_kwargs.pop("reasoning_effort", None)
+                    resp = self.client.chat.completions.create(**create_kwargs)
+                else:
+                    raise
+
             msg = resp.choices[0].message
 
-            if not msg.tool_calls:
-                return (msg.content or "", "end_turn")
+            # Token tracking
+            self.token_tracker.update(resp.usage)
+            if self._agent_id and resp.usage:
+                agent_registry.record_tokens(
+                    self._agent_id,
+                    input_tokens=getattr(resp.usage, "prompt_tokens", 0) or 0,
+                    output_tokens=getattr(resp.usage, "completion_tokens", 0) or 0,
+                )
 
-            iterations += 1
-            messages.append(msg)
+            # Extract thinking content (provider-specific)
+            thinking_text, answer_text = extract_thinking(
+                msg, self.provider, self._active_model, self._base_url
+            )
+            if thinking_text:
+                _log(f"[Thinking] {thinking_text[:120]}...")
+                if self.send_update:
+                    self.send_update(f"💭 {thinking_text[:200]}{'...' if len(thinking_text) > 200 else ''}")
+
+            # Warn if approaching context limit
+            if self.token_tracker.should_warn(self._active_model):
+                self.token_tracker._warned = True
+                warn_msg = f"⚠️ {self.token_tracker.status_line(self._active_model)} — will auto-compact soon."
+                _log(f"[Context] {warn_msg}")
+                if self.send_update:
+                    self.send_update(warn_msg)
+
+            # Auto-compact if over threshold
+            if self.token_tracker.should_compact(self._active_model):
+                _log(f"[Compact] Token threshold reached ({self.token_tracker.status_line(self._active_model)}). Auto-compacting.")
+                try:
+                    _prev_source = self.query_source
+                    self.query_source = "compact"
+                    keep_recent = self.config.get("compaction_keep_recent", 10)
+                    summary = self.history.compact(self._summarize_history, keep_recent)
+                    self.query_source = _prev_source
+                    if summary:
+                        _log(f"[Compact] Done. Summary: {len(summary)} chars.")
+                        self.token_tracker.reset()
+                        messages = _rebuild_messages()
+                except Exception as e:
+                    self.query_source = _prev_source
+                    _log(f"[Compact] Failed: {e}")
+                    self.token_tracker.record_failure()
+                    if self.token_tracker.circuit_open:
+                        _log("[Compact] Circuit open — compaction disabled for this session.")
+
+            if not msg.tool_calls:
+                return (answer_text, "end_turn")
+
+            new_turn = iterations + 1
+            # For providers where reasoning_content must NOT be passed back (e.g. DeepSeek),
+            # strip it from the message before appending to the in-loop history.
+            if strip_thinking and thinking_text:
+                import copy
+                msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
+                msg_dict.pop("reasoning_content", None)
+                messages.append(msg_dict)
+            else:
+                messages.append(msg)
+            tool_results = []
             for call in msg.tool_calls:
                 fn = call.function
                 inputs = json.loads(fn.arguments)
-                _log(f"[Tool {iterations}/{'∞' if max_turns is None else max_turns}|{self.query_source}] {fn.name}({str(inputs)[:120]})")
+                _log(f"[Tool {new_turn}/{'∞' if max_turns is None else max_turns}|{self.query_source}] {fn.name}({str(inputs)[:120]})")
                 result = str(tool_module.execute(fn.name, inputs, self.send_update, permission_fn))
                 _log(f"[Result] {result[:200]}")
-                messages.append({
+                tool_results.append({
                     "role": "tool",
                     "tool_call_id": call.id,
                     "content": result,
                 })
+                if self._agent_id:
+                    agent_registry.record_tool(self._agent_id, fn.name)
+
+            # Nudge messages injected into last tool result
+            nudges = []
+            if len(msg.tool_calls) == 1:
+                nudges.append("[SYSTEM] You called 1 tool. What else could you call in parallel right now? Aim for 3+ tools per iteration.")
+            remaining = None if max_turns is None else max_turns - new_turn
+            if remaining is not None and remaining <= 10:
+                nudges.append(
+                    f"[SYSTEM] {new_turn}/{max_turns} iterations used, {remaining} remaining. "
+                    f"Batch all remaining tool calls — no single-tool responses."
+                )
+            if nudges and tool_results:
+                last = tool_results[-1]
+                tool_results[-1] = {**last, "content": last["content"] + "\n\n" + "\n".join(nudges)}
+
+            messages.extend(tool_results)
+
+            # Stuck-loop detection
+            call_sig = "|".join(
+                f"{c.function.name}:{c.function.arguments}"
+                for c in msg.tool_calls
+            )
+            new_last3 = (state.last3_calls + (call_sig,))[-3:]
+            state = _dc_replace(state, turn_count=new_turn, last3_calls=new_last3)
+            if len(state.last3_calls) == 3 and len(set(state.last3_calls)) == 1:
+                return (
+                    "Stuck in a loop — same tool call repeated 3 times. Stop and tell the user what you tried and what failed.",
+                    "stuck",
+                )
+
+            # Coordinator abort / message drain
+            if self._agent_id and agent_registry.is_aborted(self._agent_id):
+                return ("[Agent stopped by coordinator.]", "aborted")
+            if self._agent_id:
+                for coord_msg in agent_registry.drain_messages(self._agent_id):
+                    _log(f"[Agent] Received coordinator message: {coord_msg[:80]}")
+                    messages.append({"role": "user", "content": f"[Message from coordinator]: {coord_msg}"})
+
+            iterations = new_turn
 
         return ("Still working — hit iteration limit, resuming automatically...", "max_turns")
 
@@ -810,7 +959,7 @@ class Agent:
                 "description": t["description"],
                 "parameters": t["input_schema"],
             }
-            for t in tool_module.TOOL_DEFINITIONS
+            for t in self._build_cached_tools()
         ]
 
         iterations = 0
