@@ -1,5 +1,6 @@
 ---
 name: worker
+max-turns: 200
 disallowed-tools: run_agent, send_to_agent, stop_agent, list_agents
 ---
 

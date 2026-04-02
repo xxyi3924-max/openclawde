@@ -3,8 +3,10 @@ import json
 import re
 import threading
 import time
+from dataclasses import dataclass, replace as _dc_replace
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from anthropic import Anthropic
 import anthropic as anthropic_module
@@ -15,16 +17,13 @@ import tools as tool_module
 import agents as agent_types_module
 import hooks as hooks_module
 from coordinator import get_coordinator_system_prompt, is_coordinator_mode
-from memory.history import ConversationHistory
-from memory.tasks import TaskStore
 from memory.token_log import log_tokens
-from memory.token_tracker import TokenTracker
 from memory.dream import DreamConsolidator
+from session import Session
 from tools import agent_registry
 
 MEMORY_DIR = Path(__file__).parent / "memory"
 MEMORY_DIR.mkdir(exist_ok=True)
-HISTORY_FILE = MEMORY_DIR / "conversation.json"
 TOKEN_LOG = MEMORY_DIR / "token_usage.jsonl"
 RUN_LOG = MEMORY_DIR / "run.log"
 
@@ -37,10 +36,25 @@ def _log(msg: str):
         f.write(line + "\n")
 
 
-MAX_TOOL_ITERATIONS = 30
+# Claude Code uses unlimited for the main interactive loop and 200 for fork subagents.
+# We mirror that: main agent = unlimited unless config sets max_iterations,
+# subagents = 200 unless their agent type sets max-turns.
+_SUBAGENT_DEFAULT_MAX_TURNS = 200
 
 CONTINUE_TOKEN = "[[CONTINUE]]"
 SILENT_TOKEN = "[[SILENT]]"
+
+
+@dataclass(frozen=True)
+class TurnState:
+    """Immutable per-iteration control state for the agentic loop.
+
+    Mirrors Claude Code's local State struct in queryLoop(). The messages
+    list is kept separate (it is appended to in-place); only scalar control
+    fields live here. Advance with _dc_replace(state, ...).
+    """
+    turn_count: int = 0
+    last3_calls: tuple = ()  # last ≤3 call signatures for stuck-loop detection
 
 SYSTEM_PROMPT = """You are an autonomous AI agent running on the user's Mac, accessed via Telegram. Do the work — never ask the user to run commands or verify output yourself.
 
@@ -142,10 +156,9 @@ class Agent:
         self.provider = config.get("provider", "anthropic")
         self.model = config.get("model", "claude-sonnet-4-6")
 
-        self.history = ConversationHistory(
-            HISTORY_FILE,
-            max_history=config.get("max_history", 100),
-        )
+        # Session holds history, token tracker, and task store as one unit.
+        # Rebuild this object on /clear to get a fresh session ID + clean state.
+        self.session = Session.new(config)
         self._apply_persisted_grants()
 
         # Phase 2: set by main.py — Telegram handler and callback queue for permission prompts
@@ -158,9 +171,6 @@ class Agent:
         # When set, overrides TOOL_DEFINITIONS for this agent instance
         self._sub_agent_tools: list[dict] | None = None
 
-        # Token-aware compaction tracker
-        self.token_tracker = TokenTracker()
-
         # Autonomous mode: skip all permission confirmation, auto-approve everything
         self._autonomous = config.get("autonomous", False)
 
@@ -168,11 +178,11 @@ class Agent:
         self._agent_type_name: str | None = None
         self._agent_type_system_prompt: str | None = None
 
-        # Phase 4: task tracker
-        task_db = Path(__file__).parent / config.get("task_db", "memory/tasks.db")
-        self.task_store = TaskStore(task_db)
-        from tools.task_tools import set_store
-        set_store(self.task_store)
+        # Per-instance turn limit (set by agent type; None = use config default)
+        self._max_turns: Optional[int] = None
+
+        # Query source tag — used in logs and compaction to distinguish call origins
+        self.query_source: str = "user"
 
         # Fallback model state
         self._active_model = self.model
@@ -206,7 +216,23 @@ class Agent:
         except Exception as e:
             _log(f"[MCP] Skipped: {e}")
 
-        _log(f"[Agent] Loaded {len(self.history)} history entries")
+        _log(f"[Agent] session={self.session.session_id[:8]} loaded {len(self.history)} history entries")
+
+    # ------------------------------------------------------------------
+    # Session property shims — keep all code using self.history etc. working
+    # ------------------------------------------------------------------
+
+    @property
+    def history(self):
+        return self.session.history
+
+    @property
+    def token_tracker(self):
+        return self.session.token_tracker
+
+    @property
+    def task_store(self):
+        return self.session.task_store
 
     # ------------------------------------------------------------------
     # History helpers
@@ -221,7 +247,8 @@ class Agent:
                     sandbox.grant_access(m.group(1).strip())
 
     def clear_history(self):
-        self.history.clear()
+        self.session = Session.new(self.config)
+        _log(f"[Agent] /clear — new session={self.session.session_id[:8]}")
 
     # ------------------------------------------------------------------
     # Public interface
@@ -234,32 +261,24 @@ class Agent:
 
         self.history.append({"role": "user", "content": user_message})
 
-        # Phase 5: Compact history if over threshold
-        threshold = self.config.get("compaction_threshold_messages", 40)
-        keep_recent = self.config.get("compaction_keep_recent", 10)
-        if self.history.should_compact(threshold):
-            _log(f"[Compact] History has {len(self.history)} messages — compacting to {keep_recent} recent + summary")
-            summary = self.history.compact(self._summarize_history, keep_recent)
-            if summary:
-                _log(f"[Compact] Done. Summary length: {len(summary)} chars")
-
         # Build permission_fn for this turn (requires chat_id from respond() caller)
         _permission_fn = self._make_permission_fn(getattr(self, "_current_chat_id", 0))
 
         max_retries = 5
+        raw: tuple[str, str] = ("", "error")
         for attempt in range(max_retries):
             try:
                 if self.provider == "anthropic":
-                    response = self._anthropic_loop(_permission_fn)
+                    raw = self._anthropic_loop(_permission_fn)
                 elif self.provider == "minimax":
-                    response = self._openai_loop(_permission_fn)
+                    raw = self._openai_loop(_permission_fn)
                 elif self.config.get("use_responses_api"):
-                    response = self._openai_responses_loop(_permission_fn)
+                    raw = self._openai_responses_loop(_permission_fn)
                 else:
-                    response = self._openai_loop(_permission_fn)
+                    raw = self._openai_loop(_permission_fn)
                 break
             except (OpenAIRateLimitError, anthropic_module.RateLimitError) as e:
-                response = self._handle_rate_limit(str(e))
+                raw = self._handle_rate_limit(str(e))
                 _log(f"[Rate limit] {e}")
                 break
             except (anthropic_module.APIConnectionError, anthropic_module.APITimeoutError) as e:
@@ -269,26 +288,36 @@ class Agent:
                     time.sleep(wait)
                     continue
                 _log(f"[Agent error] {e}")
-                response = f"Connection error after {max_retries} attempts — network may be unstable."
+                raw = (f"Connection error after {max_retries} attempts — network may be unstable.", "error")
                 break
             except Exception as e:
                 err = str(e)
                 _log(f"[Agent error] {err}")
                 if "400" in err and "flagged" in err.lower():
                     self.history.history.pop()
-                    response = (
+                    raw = (
                         "Your message was flagged by the content filter. "
-                        "If this keeps happening, send /clear to reset the conversation history."
+                        "If this keeps happening, send /clear to reset the conversation history.",
+                        "error",
                     )
                 else:
-                    response = f"Error: {e}"
+                    raw = (f"Error: {e}", "error")
                 break
 
+        response, exit_reason = raw
+
+        # Agent embedded [[CONTINUE]] in its reply (multi-step continuation)
         if CONTINUE_TOKEN in response:
             response = response.replace(CONTINUE_TOKEN, "").strip()
             tool_module._continuation = (
                 "Continue the task from where you left off. "
                 "Check workspace/ files to see what was already done and pick up from the next step."
+            )
+        # Loop hit its turn limit — set continuation for automatic resume
+        elif exit_reason == "max_turns":
+            tool_module._continuation = (
+                "You hit the iteration limit mid-task. Check workspace/ files to see what was "
+                "already completed, then continue from where you left off. Do not redo finished work."
             )
 
         if response.strip() == SILENT_TOKEN:
@@ -302,7 +331,7 @@ class Agent:
     # Rate limit handling
     # ------------------------------------------------------------------
 
-    def _handle_rate_limit(self, error_detail: str) -> str:
+    def _handle_rate_limit(self, error_detail: str) -> tuple[str, str]:
         fallback_model = self.config.get("fallback_model", "gpt-4o-mini")
         cooldown = self.config.get("fallback_cooldown_seconds", 60)
 
@@ -320,9 +349,9 @@ class Agent:
                 else:
                     return self._openai_loop()
             except Exception as e:
-                return f"{notice}\n(Fallback also failed: {e})"
+                return (f"{notice}\n(Fallback also failed: {e})", "error")
         else:
-            return f"Still rate limited on primary. Using {self._active_model}. Primary retries in {cooldown}s."
+            return (f"Still rate limited on primary. Using {self._active_model}. Primary retries in {cooldown}s.", "error")
 
     def _switch_to_fallback(self, fallback_model: str, cooldown: int):
         self._active_model = fallback_model
@@ -467,7 +496,7 @@ class Agent:
             _log(f"[Prune] tool_results={pruned_results} thinking_blocks={pruned_thinking}")
         return messages
 
-    def _anthropic_loop(self, permission_fn=None) -> str:
+    def _anthropic_loop(self, permission_fn=None) -> tuple[str, str]:
         ctx = self.config.get("max_context_messages", 20)
         raw = [
             {"role": m["role"], "content": m["content"]}
@@ -483,21 +512,27 @@ class Agent:
         while messages and messages[-1]["role"] == "assistant":
             messages.pop()
 
-        iterations = 0
-        _last_calls: list[tuple[str, str]] = []
         thinking_budget = self.config.get("thinking_budget", 0)
         max_tokens = max(8192, thinking_budget + 4096) if thinking_budget else 8192
         cached_system = self._build_cached_system()
         initial_msg_count = len(messages)
-        MAX_LOOP_PAIRS = self.config.get("max_loop_pairs", 12)
+        max_loop_pairs = self.config.get("max_loop_pairs", 12)
+        # Main agent: unlimited unless config sets max_iterations (mirrors Claude Code).
+        # Sub-agents: type limit → config → 200 (Claude Code fork subagent default).
+        if self._agent_id is None:
+            max_turns = self.config.get("max_iterations")  # None = unlimited
+        else:
+            max_turns = self._max_turns or self.config.get("max_iterations", _SUBAGENT_DEFAULT_MAX_TURNS)
 
-        while iterations < MAX_TOOL_ITERATIONS:
+        state = TurnState()
+
+        while max_turns is None or state.turn_count < max_turns:
             if tool_module.is_cancelled():
-                return "Interrupted."
+                return ("Interrupted.", "interrupted")
 
             loop_msgs = messages[initial_msg_count:]
-            if len(loop_msgs) > MAX_LOOP_PAIRS * 2:
-                excess = len(loop_msgs) - MAX_LOOP_PAIRS * 2
+            if len(loop_msgs) > max_loop_pairs * 2:
+                excess = len(loop_msgs) - max_loop_pairs * 2
                 trim = excess + (excess % 2)
                 messages = messages[:initial_msg_count] + loop_msgs[trim:]
 
@@ -565,9 +600,12 @@ class Agent:
             if self.token_tracker.should_compact(self._active_model):
                 _log(f"[Compact] Token threshold reached ({self.token_tracker.status_line(self._active_model)}). Auto-compacting.")
                 try:
+                    _prev_source = self.query_source
+                    self.query_source = "compact"
                     threshold = self.config.get("compaction_threshold_messages", 40)
                     keep_recent = self.config.get("compaction_keep_recent", 10)
                     summary = self.history.compact(self._summarize_history, keep_recent)
+                    self.query_source = _prev_source
                     if summary:
                         _log(f"[Compact] Done. Summary: {len(summary)} chars.")
                         self.token_tracker.reset()
@@ -585,6 +623,7 @@ class Agent:
                                 messages.append(dict(msg))
                         initial_msg_count = len(messages)
                 except Exception as e:
+                    self.query_source = _prev_source
                     _log(f"[Compact] Failed: {e}")
                     self.token_tracker.record_failure()
                     if self.token_tracker.circuit_open:
@@ -592,10 +631,10 @@ class Agent:
 
             if resp.stop_reason == "end_turn":
                 parts = [b.text for b in resp.content if hasattr(b, "text") and b.type == "text"]
-                return "\n".join(parts).strip()
+                return ("\n".join(parts).strip(), "end_turn")
 
             if resp.stop_reason == "tool_use":
-                iterations += 1
+                new_turn = state.turn_count + 1
                 assistant_content = []
                 tool_calls_to_exec = []
 
@@ -611,7 +650,7 @@ class Agent:
                             "name": block.name,
                             "input": block.input,
                         })
-                        _log(f"[Tool {iterations}] {block.name}({json.dumps(block.input)[:120]})")
+                        _log(f"[Tool {new_turn}/{'∞' if max_turns is None else max_turns}|{self.query_source}] {block.name}({json.dumps(block.input)[:120]})")
                         tool_calls_to_exec.append(block)
 
                 tool_results = []
@@ -642,10 +681,10 @@ class Agent:
                 if tools_this_iter == 1:
                     nudges.append("[SYSTEM] You called 1 tool. What else could you call in parallel right now? Aim for 3+ tools per iteration.")
 
-                remaining = MAX_TOOL_ITERATIONS - iterations
-                if remaining <= 10:
+                remaining = None if max_turns is None else max_turns - new_turn
+                if remaining is not None and remaining <= 10:
                     nudges.append(
-                        f"[SYSTEM] {iterations}/{MAX_TOOL_ITERATIONS} iterations used, {remaining} remaining. "
+                        f"[SYSTEM] {new_turn}/{max_turns} iterations used, {remaining} remaining. "
                         f"Batch all remaining tool calls — no single-tool responses."
                     )
 
@@ -663,7 +702,7 @@ class Agent:
 
                 # --- Multi-agent: check for abort signal from coordinator ---
                 if self._agent_id and agent_registry.is_aborted(self._agent_id):
-                    return "[Agent stopped by coordinator.]"
+                    return ("[Agent stopped by coordinator.]", "aborted")
 
                 # --- Multi-agent: drain pending messages from coordinator ---
                 if self._agent_id:
@@ -679,26 +718,25 @@ class Agent:
                     f"{b['name']}:{json.dumps(b['input'], sort_keys=True)}"
                     for b in assistant_content if b["type"] == "tool_use"
                 )
-                _last_calls.append(call_sig)
-                if len(_last_calls) > 3:
-                    _last_calls.pop(0)
-                if len(_last_calls) == 3 and len(set(_last_calls)) == 1:
-                    return "Stuck in a loop — same tool call repeated 3 times. Stop and tell the user what you tried and what failed."
+                new_last3 = (state.last3_calls + (call_sig,))[-3:]
+                state = _dc_replace(state, turn_count=new_turn, last3_calls=new_last3)
+
+                if len(state.last3_calls) == 3 and len(set(state.last3_calls)) == 1:
+                    return (
+                        "Stuck in a loop — same tool call repeated 3 times. Stop and tell the user what you tried and what failed.",
+                        "stuck",
+                    )
 
             else:
-                return f"Unexpected stop reason: {resp.stop_reason}"
+                return (f"Unexpected stop reason: {resp.stop_reason}", "error")
 
-        tool_module._continuation = (
-            "You hit the iteration limit mid-task. Check workspace/ files to see what was "
-            "already completed, then continue from where you left off. Do not redo finished work."
-        )
-        return "Still working — hit iteration limit, resuming automatically..."
+        return ("Still working — hit iteration limit, resuming automatically...", "max_turns")
 
     # ------------------------------------------------------------------
     # OpenAI Chat Completions loop
     # ------------------------------------------------------------------
 
-    def _openai_loop(self, permission_fn=None) -> str:
+    def _openai_loop(self, permission_fn=None) -> tuple[str, str]:
         ctx = self.config.get("max_context_messages", 20)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for m in self.history.get_recent(ctx):
@@ -718,10 +756,14 @@ class Agent:
         ]
 
         iterations = 0
+        if self._agent_id is None:
+            max_turns = self.config.get("max_iterations")
+        else:
+            max_turns = self._max_turns or self.config.get("max_iterations", _SUBAGENT_DEFAULT_MAX_TURNS)
 
-        while iterations < MAX_TOOL_ITERATIONS:
+        while max_turns is None or iterations < max_turns:
             if tool_module.is_cancelled():
-                return "Interrupted."
+                return ("Interrupted.", "interrupted")
 
             resp = self.client.chat.completions.create(
                 model=self._active_model,
@@ -732,14 +774,14 @@ class Agent:
             msg = resp.choices[0].message
 
             if not msg.tool_calls:
-                return msg.content or ""
+                return (msg.content or "", "end_turn")
 
             iterations += 1
             messages.append(msg)
             for call in msg.tool_calls:
                 fn = call.function
                 inputs = json.loads(fn.arguments)
-                _log(f"[Tool {iterations}] {fn.name}({str(inputs)[:120]})")
+                _log(f"[Tool {iterations}/{'∞' if max_turns is None else max_turns}|{self.query_source}] {fn.name}({str(inputs)[:120]})")
                 result = str(tool_module.execute(fn.name, inputs, self.send_update, permission_fn))
                 _log(f"[Result] {result[:200]}")
                 messages.append({
@@ -748,17 +790,13 @@ class Agent:
                     "content": result,
                 })
 
-        tool_module._continuation = (
-            "You hit the iteration limit mid-task. Check workspace/ files to see what was "
-            "already completed, then continue from where you left off. Do not redo finished work."
-        )
-        return "Still working — hit iteration limit, resuming automatically..."
+        return ("Still working — hit iteration limit, resuming automatically...", "max_turns")
 
     # ------------------------------------------------------------------
     # OpenAI Responses API loop
     # ------------------------------------------------------------------
 
-    def _openai_responses_loop(self, permission_fn=None) -> str:
+    def _openai_responses_loop(self, permission_fn=None) -> tuple[str, str]:
         ctx = self.config.get("max_context_messages", 20)
         input_messages = []
         for m in self.history.get_recent(ctx):
@@ -776,10 +814,14 @@ class Agent:
         ]
 
         iterations = 0
+        if self._agent_id is None:
+            max_turns = self.config.get("max_iterations")
+        else:
+            max_turns = self._max_turns or self.config.get("max_iterations", _SUBAGENT_DEFAULT_MAX_TURNS)
 
-        while iterations < MAX_TOOL_ITERATIONS:
+        while max_turns is None or iterations < max_turns:
             if tool_module.is_cancelled():
-                return "Interrupted."
+                return ("Interrupted.", "interrupted")
 
             resp = self.client.responses.create(
                 model=self._active_model,
@@ -799,7 +841,7 @@ class Agent:
                     tool_calls.append(item)
 
             if not tool_calls:
-                return "\n".join(text_parts).strip()
+                return ("\n".join(text_parts).strip(), "end_turn")
 
             iterations += 1
             for item in resp.output:
@@ -810,7 +852,7 @@ class Agent:
                     inputs = json.loads(call.arguments) if isinstance(call.arguments, str) else call.arguments
                 except Exception:
                     inputs = {}
-                _log(f"[Tool {iterations}] {call.name}({str(inputs)[:120]})")
+                _log(f"[Tool {iterations}/{'∞' if max_turns is None else max_turns}|{self.query_source}] {call.name}({str(inputs)[:120]})")
                 result = str(tool_module.execute(call.name, inputs, self.send_update, permission_fn))
                 _log(f"[Result] {result[:200]}")
                 input_messages.append({
@@ -819,11 +861,7 @@ class Agent:
                     "output": result,
                 })
 
-        tool_module._continuation = (
-            "You hit the iteration limit mid-task. Check workspace/ files to see what was "
-            "already completed, then continue from where you left off. Do not redo finished work."
-        )
-        return "Still working — hit iteration limit, resuming automatically..."
+        return ("Still working — hit iteration limit, resuming automatically...", "max_turns")
 
     # ------------------------------------------------------------------
     # Phase 5: Context compaction helpers (stubs — activated in Phase 5)

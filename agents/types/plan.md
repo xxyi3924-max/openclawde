@@ -1,5 +1,6 @@
 ---
 name: plan
+max-turns: 10
 disallowed-tools: run_python, run_shell, start_web_server, stop_web_server, run_agent, send_to_agent, stop_agent, queue_self_task
 ---
 

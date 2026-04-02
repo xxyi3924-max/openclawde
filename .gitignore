@@ -19,7 +19,9 @@ memory/tool_calls.log
 memory/MEMORY.md
 memory/notes/
 memory/agent_output/
+memory/dream_state.json
 workspace/
+bot.pid
 
 # macOS
 .DS_Store

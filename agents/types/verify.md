@@ -1,5 +1,6 @@
 ---
 name: verify
+max-turns: 10
 disallowed-tools: run_agent, send_to_agent, stop_agent, queue_self_task
 ---
 

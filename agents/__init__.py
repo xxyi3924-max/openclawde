@@ -27,6 +27,7 @@ class AgentType:
     system_prompt: str
     disallowed_tools: list[str] = field(default_factory=list)
     model: Optional[str] = None  # None = inherit parent model
+    max_turns: Optional[int] = None  # None = inherit from config
 
 
 class AgentTypeManager:
@@ -66,7 +67,9 @@ class AgentTypeManager:
             for t in meta.get("disallowed-tools", "").split(",")
             if t.strip()
         ]
-        return AgentType(name=name, system_prompt=body, disallowed_tools=disallowed, model=model_raw)
+        max_turns_raw = meta.get("max-turns", "").strip()
+        max_turns = int(max_turns_raw) if max_turns_raw.isdigit() else None
+        return AgentType(name=name, system_prompt=body, disallowed_tools=disallowed, model=model_raw, max_turns=max_turns)
 
     def get(self, name: str) -> Optional[AgentType]:
         return self._types.get(name)

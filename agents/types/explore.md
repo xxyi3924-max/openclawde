@@ -1,6 +1,7 @@
 ---
 name: explore
 model: haiku
+max-turns: 15
 disallowed-tools: write_file, edit_file, run_python, run_shell, start_web_server, stop_web_server, write_note, delete_note, run_agent, send_to_agent, stop_agent, queue_self_task
 ---
 

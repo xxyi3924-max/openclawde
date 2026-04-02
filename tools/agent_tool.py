@@ -68,6 +68,8 @@ def _apply_agent_type(sub, agent_type_name: str):
             if at.model:
                 sub._active_model = at.model
                 sub.model = at.model
+            if at.max_turns is not None:
+                sub._max_turns = at.max_turns
             # Build restricted tool list from type's disallowed list + coordinator-only block
             import tools as _tool_module
             base = _filter_tools_for_subagent(list(_tool_module.TOOL_DEFINITIONS))
