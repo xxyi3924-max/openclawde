@@ -514,12 +514,20 @@ class Agent:
             if tool_module.is_cancelled():
                 return ("Interrupted.", "interrupted")
 
-            # Context sliding: keep in-loop pairs bounded so messages don't grow unboundedly
+            # Context sliding: keep in-loop messages bounded.
+            # Always trim to the next assistant message boundary so we never
+            # orphan tool-result messages from their originating tool_calls.
+            # (Anthropic packs all results into one user message so pairs of 2
+            # are always safe; OpenAI emits one message per tool result so a
+            # naive even-trim can split a turn mid-flight and cause 400 errors.)
             loop_msgs = messages[initial_msg_count:]
             if len(loop_msgs) > max_loop_pairs * 2:
                 excess = len(loop_msgs) - max_loop_pairs * 2
-                trim = excess + (excess % 2)
-                messages = messages[:initial_msg_count] + loop_msgs[trim:]
+                trim = excess
+                while trim < len(loop_msgs) and loop_msgs[trim].get("role") != "assistant":
+                    trim += 1
+                if trim < len(loop_msgs):
+                    messages = messages[:initial_msg_count] + loop_msgs[trim:]
 
             messages = adapter.prune_messages(messages)
 
