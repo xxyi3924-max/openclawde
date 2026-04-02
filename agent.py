@@ -263,6 +263,27 @@ class Agent:
         if m:
             sandbox.grant_access(m.group(1).strip())
 
+        # Safety gate 1: session wall-clock timeout (default 6h for autonomous phone use).
+        # Claude Code's bridge uses 24h; 6h is tighter for unattended Telegram sessions.
+        timeout_hours = self.config.get("session_timeout_hours", 6)
+        if timeout_hours:
+            elapsed = (time.time() - self.session.started_at) / 3600
+            if elapsed > timeout_hours:
+                _log(f"[Session] Wall-clock timeout after {elapsed:.1f}h (limit {timeout_hours}h)")
+                return (
+                    f"⏱ Session expired after {timeout_hours}h of continuous use. "
+                    f"Send /clear to start a fresh session."
+                )
+
+        # Safety gate 2: blocking limit — context window nearly full.
+        # TokenTracker.is_blocking() is defined but was never wired here; now it is.
+        if self.token_tracker.is_blocking(self._active_model):
+            _log(f"[Blocking] {self.token_tracker.status_line(self._active_model)}")
+            return (
+                "⚠️ Context window is nearly full and cannot accept more input. "
+                "Send /compact to summarise history, or /clear to start fresh."
+            )
+
         self.history.append({"role": "user", "content": user_message})
 
         # Build permission_fn for this turn (requires chat_id from respond() caller)
@@ -422,6 +443,49 @@ class Agent:
         last["cache_control"] = {"type": "ephemeral"}
         return tools[:-1] + [last]
 
+    def _build_system_text(self) -> str:
+        """Plain-text version of _build_cached_system() for OpenAI-format loops.
+
+        Produces the same content as _build_cached_system() (agent type, coordinator,
+        planning mode, persistent memory) but as a single string — no cache_control
+        markers, compatible with OpenAI's role:system message format.
+        """
+        if self._agent_type_system_prompt:
+            base = self._agent_type_system_prompt
+        elif is_coordinator_mode():
+            base = get_coordinator_system_prompt()
+        else:
+            base = SYSTEM_PROMPT
+
+        parts = [base]
+
+        if tool_module._planning_mode:
+            parts.append(
+                "\n## PLANNING MODE ACTIVE\n"
+                "You are in read-only planning mode. Write/execute tools are not available.\n"
+                "Your job: research the task using read tools, then present a clear step-by-step plan as text.\n"
+                "Do NOT attempt to execute anything. End with: 'Send /execute when ready to proceed.'"
+            )
+
+        from memory import load_context
+        context = load_context(task_store=self.task_store)
+        if context:
+            parts.append(f"\n## Persistent memory from previous sessions\n{context}")
+
+        return "\n".join(parts)
+
+    def _cap_tool_result(self, result: str) -> str:
+        """Truncate oversized tool results to prevent context explosion.
+
+        Matches Claude Code's per-tool size limits (toolLimits.ts). Default 20,000
+        chars; configurable via max_tool_result_chars in config.
+        """
+        max_chars = self.config.get("max_tool_result_chars", 20_000)
+        if len(result) > max_chars:
+            trimmed = len(result) - max_chars
+            return result[:max_chars] + f"\n…[{trimmed:,} chars truncated — result too large]"
+        return result
+
     def _make_permission_fn(self, chat_id: int):
         """
         Returns a permission_fn closure that asks the user via Telegram inline keyboard.
@@ -539,6 +603,9 @@ class Agent:
         cached_system = self._build_cached_system()
         initial_msg_count = len(messages)
         max_loop_pairs = self.config.get("max_loop_pairs", 12)
+        # Streaming idle watchdog: abort if no SSE chunks arrive for N seconds.
+        # Matches Claude Code claude.ts STREAM_IDLE_TIMEOUT_MS (default 90s).
+        stream_idle_timeout = self.config.get("stream_idle_timeout_seconds", 90)
         # Main agent: unlimited unless config sets max_iterations (mirrors Claude Code).
         # Sub-agents: type limit → config → 200 (Claude Code fork subagent default).
         if self._agent_id is None:
@@ -567,8 +634,35 @@ class Agent:
             )
             if thinking_budget:
                 create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+            if stream_idle_timeout:
+                create_kwargs["timeout"] = stream_idle_timeout
 
-            with self.client.messages.stream(**create_kwargs) as stream:
+            try:
+                stream_ctx = self.client.messages.stream(**create_kwargs)
+            except anthropic_module.BadRequestError as e:
+                if "prompt is too long" in str(e).lower() or getattr(e, "status_code", 0) == 413:
+                    _log(f"[ReactiveCompact] Context too long, compacting and retrying: {e}")
+                    keep_recent = self.config.get("compaction_keep_recent", 10)
+                    summary = self.history.compact(self._summarize_history, keep_recent)
+                    if summary:
+                        raw2 = [{"role": m["role"], "content": m["content"]} for m in self.history.get_recent(ctx) if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
+                        messages = []
+                        for msg in raw2:
+                            if messages and messages[-1]["role"] == msg["role"]:
+                                messages[-1]["content"] += "\n\n" + msg["content"]
+                            else:
+                                messages.append(dict(msg))
+                        while messages and messages[-1]["role"] == "assistant":
+                            messages.pop()
+                        create_kwargs["messages"] = messages
+                        initial_msg_count = len(messages)
+                        stream_ctx = self.client.messages.stream(**create_kwargs)
+                    else:
+                        raise
+                else:
+                    raise
+
+            with stream_ctx as stream:
                 _cur_type = None
                 _cur_chunks: list[str] = []
 
@@ -685,14 +779,14 @@ class Agent:
                         }
                         results_map = {}
                         for future, blk in futures.items():
-                            results_map[blk.id] = str(future.result())
+                            results_map[blk.id] = self._cap_tool_result(str(future.result()))
                     for blk in tool_calls_to_exec:
                         result = results_map[blk.id]
                         _log(f"[Result] {result[:200]}")
                         tool_results.append({"type": "tool_result", "tool_use_id": blk.id, "content": result})
                 else:
                     for blk in tool_calls_to_exec:
-                        result = str(tool_module.execute(blk.name, blk.input, self.send_update, permission_fn, _aid))
+                        result = self._cap_tool_result(str(tool_module.execute(blk.name, blk.input, self.send_update, permission_fn, _aid)))
                         _log(f"[Result] {result[:200]}")
                         tool_results.append({"type": "tool_result", "tool_use_id": blk.id, "content": result})
 
@@ -762,7 +856,9 @@ class Agent:
         ctx = self.config.get("max_context_messages", 20)
 
         def _rebuild_messages() -> list:
-            msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+            # Use _build_system_text() so MiniMax/OpenAI gets the same context injection
+            # (persistent memory, planning mode, agent type) as the Anthropic loop.
+            msgs = [{"role": "system", "content": self._build_system_text()}]
             for m in self.history.get_recent(ctx):
                 if isinstance(m.get("content"), str):
                     msgs.append({"role": m["role"], "content": m["content"]})
@@ -810,19 +906,33 @@ class Agent:
             if thinking_kwargs and not _thinking_unsupported:
                 create_kwargs.update(thinking_kwargs)
 
-            try:
-                resp = self.client.chat.completions.create(**create_kwargs)
-            except Exception as e:
-                err = str(e)
-                # Provider rejected thinking param (e.g. real OpenAI 400 "unknown_parameter")
-                if thinking_kwargs and not _thinking_unsupported and ("unknown_parameter" in err or "unknown field" in err.lower() or "400" in err):
-                    _log(f"[Thinking] Provider rejected thinking param, disabling: {err[:120]}")
-                    _thinking_unsupported = True
-                    create_kwargs.pop("extra_body", None)
-                    create_kwargs.pop("reasoning_effort", None)
-                    resp = self.client.chat.completions.create(**create_kwargs)
-                else:
+            def _oai_create(kwargs):
+                """Run create() with graceful fallbacks for thinking params and context length."""
+                nonlocal _thinking_unsupported
+                try:
+                    return self.client.chat.completions.create(**kwargs)
+                except Exception as e:
+                    err = str(e)
+                    # Thinking param rejected — disable and retry
+                    if thinking_kwargs and not _thinking_unsupported and (
+                        "unknown_parameter" in err or "unknown field" in err.lower()
+                    ):
+                        _log(f"[Thinking] Provider rejected thinking param, disabling: {err[:120]}")
+                        _thinking_unsupported = True
+                        kwargs.pop("extra_body", None)
+                        kwargs.pop("reasoning_effort", None)
+                        return self.client.chat.completions.create(**kwargs)
+                    # Context too long — reactive compact then retry
+                    if "context_length_exceeded" in err or "maximum context length" in err.lower() or "413" in err:
+                        _log(f"[ReactiveCompact] Context too long, compacting and retrying: {err[:120]}")
+                        keep_recent = self.config.get("compaction_keep_recent", 10)
+                        summary = self.history.compact(self._summarize_history, keep_recent)
+                        if summary:
+                            kwargs["messages"] = _rebuild_messages()
+                            return self.client.chat.completions.create(**kwargs)
                     raise
+
+            resp = _oai_create(create_kwargs)
 
             msg = resp.choices[0].message
 
@@ -886,19 +996,28 @@ class Agent:
             else:
                 messages.append(msg)
             tool_results = []
-            for call in msg.tool_calls:
+            _aid = self._agent_id or ""
+            _max_str = '∞' if max_turns is None else max_turns
+
+            def _exec_oai_call(call):
                 fn = call.function
                 inputs = json.loads(fn.arguments)
-                _log(f"[Tool {new_turn}/{'∞' if max_turns is None else max_turns}|{self.query_source}] {fn.name}({str(inputs)[:120]})")
-                result = str(tool_module.execute(fn.name, inputs, self.send_update, permission_fn))
+                _log(f"[Tool {new_turn}/{_max_str}|{self.query_source}] {fn.name}({str(inputs)[:120]})")
+                result = self._cap_tool_result(str(tool_module.execute(fn.name, inputs, self.send_update, permission_fn, _aid)))
                 _log(f"[Result] {result[:200]}")
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": result,
-                })
                 if self._agent_id:
                     agent_registry.record_tool(self._agent_id, fn.name)
+                return call.id, result
+
+            if len(msg.tool_calls) > 1:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = {executor.submit(_exec_oai_call, call): call for call in msg.tool_calls}
+                    results_map = {call_id: res for future in futures for call_id, res in [future.result()]}
+                for call in msg.tool_calls:
+                    tool_results.append({"role": "tool", "tool_call_id": call.id, "content": results_map[call.id]})
+            else:
+                call_id, result = _exec_oai_call(msg.tool_calls[0])
+                tool_results.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
             # Nudge messages injected into last tool result
             nudges = []
