@@ -21,6 +21,7 @@ from memory.token_log import log_tokens
 from memory.dream import DreamConsolidator
 from session import Session
 from thinking import get_thinking_kwargs, extract_thinking, should_strip_thinking_from_history
+from provider_adapters import AnthropicAdapter, OpenAIAdapter
 from tools import agent_registry
 
 MEMORY_DIR = Path(__file__).parent / "memory"
@@ -474,6 +475,186 @@ class Agent:
 
         return "\n".join(parts)
 
+    def _get_tool_defs(self) -> list[dict]:
+        """Return raw tool definitions without provider-specific formatting.
+
+        Adapters call build_tools() on these to add cache_control (Anthropic)
+        or wrap in the "function" schema (OpenAI).
+        """
+        if self._sub_agent_tools is not None:
+            return list(self._sub_agent_tools)
+        elif tool_module._planning_mode:
+            return [td.to_api_dict() for td in tool_module._BUILTIN_TOOL_DEFS if td.planning_allowed]
+        return list(tool_module.TOOL_DEFINITIONS)
+
+    def _agent_loop(self, adapter, permission_fn=None) -> tuple[str, str]:
+        """Unified agentic loop — provider-agnostic.
+
+        All provider-specific work (API call, message format, tool format,
+        streaming, thinking extraction, pruning) is delegated to `adapter`.
+        This loop body is the same for both Anthropic and OpenAI providers,
+        mirroring Claude Code's single queryLoop().
+        """
+        ctx = self.config.get("max_context_messages", 20)
+        system_text = self._build_system_text()
+        system = adapter.build_system(system_text)
+        tools = adapter.build_tools(self._get_tool_defs())
+        messages = adapter.build_messages_from_history(self.history.history, ctx, system_text)
+        initial_msg_count = len(messages)
+        max_loop_pairs = self.config.get("max_loop_pairs", 12)
+
+        if self._agent_id is None:
+            max_turns = self.config.get("max_iterations")  # None = unlimited (main agent)
+        else:
+            max_turns = self._max_turns or self.config.get("max_iterations", _SUBAGENT_DEFAULT_MAX_TURNS)
+
+        state = TurnState()
+
+        while max_turns is None or state.turn_count < max_turns:
+            if tool_module.is_cancelled():
+                return ("Interrupted.", "interrupted")
+
+            # Context sliding: keep in-loop pairs bounded so messages don't grow unboundedly
+            loop_msgs = messages[initial_msg_count:]
+            if len(loop_msgs) > max_loop_pairs * 2:
+                excess = len(loop_msgs) - max_loop_pairs * 2
+                trim = excess + (excess % 2)
+                messages = messages[:initial_msg_count] + loop_msgs[trim:]
+
+            messages = adapter.prune_messages(messages)
+
+            try:
+                parsed = adapter.call(self.client, self._active_model, system, tools, messages)
+            except Exception as e:
+                err = str(e)
+                status = getattr(e, "status_code", 0)
+                is_too_long = (
+                    "prompt is too long" in err.lower()
+                    or "context_length_exceeded" in err
+                    or "maximum context length" in err.lower()
+                    or "413" in err
+                    or status == 413
+                )
+                if is_too_long:
+                    _log(f"[ReactiveCompact] Context too long, compacting and retrying: {err[:120]}")
+                    keep_recent = self.config.get("compaction_keep_recent", 10)
+                    summary = self.history.compact(self._summarize_history, keep_recent)
+                    if summary:
+                        messages = adapter.build_messages_from_history(
+                            self.history.history, ctx, self._build_system_text()
+                        )
+                        initial_msg_count = len(messages)
+                        parsed = adapter.call(self.client, self._active_model, system, tools, messages)
+                    else:
+                        raise
+                else:
+                    raise
+
+            log_tokens(TOKEN_LOG, state.turn_count, parsed.stop_reason, parsed.usage, messages)
+            self.token_tracker.update(parsed.usage)
+
+            if self._agent_id and parsed.usage:
+                inp = getattr(parsed.usage, "input_tokens", None) or getattr(parsed.usage, "prompt_tokens", 0) or 0
+                out = getattr(parsed.usage, "output_tokens", None) or getattr(parsed.usage, "completion_tokens", 0) or 0
+                agent_registry.record_tokens(self._agent_id, input_tokens=inp, output_tokens=out)
+
+            if parsed.thinking:
+                _log(f"[Thinking] {parsed.thinking[:120]}...")
+
+            if self.token_tracker.should_warn(self._active_model):
+                self.token_tracker._warned = True
+                warn_msg = f"⚠️ {self.token_tracker.status_line(self._active_model)} — will auto-compact soon."
+                _log(f"[Context] {warn_msg}")
+                if self.send_update:
+                    self.send_update(warn_msg)
+
+            if self.token_tracker.should_compact(self._active_model):
+                _log(f"[Compact] Token threshold reached ({self.token_tracker.status_line(self._active_model)}). Auto-compacting.")
+                _prev_source = self.query_source
+                try:
+                    self.query_source = "compact"
+                    keep_recent = self.config.get("compaction_keep_recent", 10)
+                    summary = self.history.compact(self._summarize_history, keep_recent)
+                    self.query_source = _prev_source
+                    if summary:
+                        _log(f"[Compact] Done. Summary: {len(summary)} chars.")
+                        self.token_tracker.reset()
+                        messages = adapter.build_messages_from_history(
+                            self.history.history, ctx, self._build_system_text()
+                        )
+                        initial_msg_count = len(messages)
+                except Exception as e:
+                    self.query_source = _prev_source
+                    _log(f"[Compact] Failed: {e}")
+                    self.token_tracker.record_failure()
+                    if self.token_tracker.circuit_open:
+                        _log("[Compact] Circuit open — compaction disabled for this session.")
+
+            if parsed.stop_reason == "end_turn":
+                return (parsed.text, "end_turn")
+
+            if parsed.stop_reason != "tool_use" or not parsed.tool_calls:
+                return (f"Unexpected stop reason: {parsed.stop_reason}", "error")
+
+            new_turn = state.turn_count + 1
+            _aid = self._agent_id or ""
+            _max_str = "∞" if max_turns is None else max_turns
+
+            def _exec_call(tc, _permission_fn=permission_fn, _aid=_aid):
+                _log(f"[Tool {new_turn}/{_max_str}|{self.query_source}] {tc.name}({json.dumps(tc.inputs)[:120]})")
+                result = self._cap_tool_result(
+                    str(tool_module.execute(tc.name, tc.inputs, self.send_update, _permission_fn, _aid))
+                )
+                _log(f"[Result] {result[:200]}")
+                if self._agent_id:
+                    agent_registry.record_tool(self._agent_id, tc.name)
+                return tc.id, result
+
+            if len(parsed.tool_calls) > 1:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = {executor.submit(_exec_call, tc): tc for tc in parsed.tool_calls}
+                    results_map = {tc_id: res for future in futures for tc_id, res in [future.result()]}
+            else:
+                tc_id, res = _exec_call(parsed.tool_calls[0])
+                results_map = {tc_id: res}
+
+            messages.append(adapter.make_assistant_message(parsed))
+            tool_result_msgs = adapter.make_tool_result_messages(parsed.tool_calls, results_map)
+
+            nudges = []
+            if len(parsed.tool_calls) == 1:
+                nudges.append("[SYSTEM] You called 1 tool. What else could you call in parallel right now? Aim for 3+ tools per iteration.")
+            remaining = None if max_turns is None else max_turns - new_turn
+            if remaining is not None and remaining <= 10:
+                nudges.append(
+                    f"[SYSTEM] {new_turn}/{max_turns} iterations used, {remaining} remaining. "
+                    f"Batch all remaining tool calls — no single-tool responses."
+                )
+            if nudges:
+                tool_result_msgs = adapter.inject_nudge(tool_result_msgs, "\n".join(nudges))
+
+            messages.extend(tool_result_msgs)
+
+            if self._agent_id and agent_registry.is_aborted(self._agent_id):
+                return ("[Agent stopped by coordinator.]", "aborted")
+            if self._agent_id:
+                for coord_msg in agent_registry.drain_messages(self._agent_id):
+                    _log(f"[Agent] Received coordinator message: {coord_msg[:80]}")
+                    messages.append({"role": "user", "content": f"[Message from coordinator]: {coord_msg}"})
+
+            call_sig = "|".join(
+                f"{tc.name}:{json.dumps(tc.inputs, sort_keys=True)}" for tc in parsed.tool_calls
+            )
+            new_last3 = (state.last3_calls + (call_sig,))[-3:]
+            state = _dc_replace(state, turn_count=new_turn, last3_calls=new_last3)
+            if len(state.last3_calls) == 3 and len(set(state.last3_calls)) == 1:
+                return (
+                    "Stuck in a loop — same tool call repeated 3 times. Stop and tell the user what you tried and what failed.",
+                    "stuck",
+                )
+
+        return ("Still working — hit iteration limit, resuming automatically...", "max_turns")
+
     def _cap_tool_result(self, result: str) -> str:
         """Truncate oversized tool results to prevent context explosion.
 
@@ -530,535 +711,20 @@ class Agent:
         permission_fn._auto_approve_level = auto_level
         return permission_fn
 
-    def _prune_old_context_openai(self, messages: list, keep_recent: int = 3) -> list:
-        """Truncate large tool-result content in old OpenAI-format messages.
-
-        OpenAI tool results have role="tool" with a plain string content field,
-        unlike Anthropic's list-of-blocks format handled by _prune_old_context.
-        """
-        tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-        to_prune = tool_indices[:-keep_recent] if len(tool_indices) > keep_recent else []
-        pruned = 0
-        for idx in to_prune:
-            content = messages[idx].get("content", "")
-            if isinstance(content, str) and len(content) > 300:
-                messages[idx] = {**messages[idx], "content": content[:300] + " …[pruned]"}
-                pruned += 1
-        if pruned:
-            _log(f"[Prune/OAI] tool_results={pruned}")
-        return messages
-
-    def _prune_old_context(self, messages: list, keep_recent: int = 3) -> list:
-        tool_result_indices = [
-            i for i, m in enumerate(messages)
-            if m.get("role") == "user"
-            and isinstance(m.get("content"), list)
-            and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"])
-        ]
-        to_prune = tool_result_indices[:-keep_recent] if len(tool_result_indices) > keep_recent else []
-
-        pruned_results = 0
-        pruned_thinking = 0
-
-        for idx in to_prune:
-            new_blocks = []
-            for block in messages[idx]["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    text = block.get("content", "")
-                    if isinstance(text, str) and len(text) > 300:
-                        block = {**block, "content": text[:300] + " …[pruned]"}
-                        pruned_results += 1
-                new_blocks.append(block)
-            messages[idx] = {**messages[idx], "content": new_blocks}
-
-            if idx > 0 and messages[idx - 1].get("role") == "assistant":
-                asst = messages[idx - 1]
-                if isinstance(asst.get("content"), list):
-                    stripped = [b for b in asst["content"] if not (isinstance(b, dict) and b.get("type") == "thinking")]
-                    pruned_thinking += len(asst["content"]) - len(stripped)
-                    messages[idx - 1] = {**asst, "content": stripped}
-
-        if pruned_results or pruned_thinking:
-            _log(f"[Prune] tool_results={pruned_results} thinking_blocks={pruned_thinking}")
-        return messages
-
     def _anthropic_loop(self, permission_fn=None) -> tuple[str, str]:
-        ctx = self.config.get("max_context_messages", 20)
-        raw = [
-            {"role": m["role"], "content": m["content"]}
-            for m in self.history.get_recent(ctx)
-            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
-        ]
-        messages = []
-        for msg in raw:
-            if messages and messages[-1]["role"] == msg["role"]:
-                messages[-1]["content"] += "\n\n" + msg["content"]
-            else:
-                messages.append(dict(msg))
-        while messages and messages[-1]["role"] == "assistant":
-            messages.pop()
-
-        thinking_budget = self.config.get("thinking_budget", 0)
-        max_tokens = max(8192, thinking_budget + 4096) if thinking_budget else 8192
-        cached_system = self._build_cached_system()
-        initial_msg_count = len(messages)
-        max_loop_pairs = self.config.get("max_loop_pairs", 12)
-        # Streaming idle watchdog: abort if no SSE chunks arrive for N seconds.
-        # Matches Claude Code claude.ts STREAM_IDLE_TIMEOUT_MS (default 90s).
-        stream_idle_timeout = self.config.get("stream_idle_timeout_seconds", 90)
-        # Main agent: unlimited unless config sets max_iterations (mirrors Claude Code).
-        # Sub-agents: type limit → config → 200 (Claude Code fork subagent default).
-        if self._agent_id is None:
-            max_turns = self.config.get("max_iterations")  # None = unlimited
-        else:
-            max_turns = self._max_turns or self.config.get("max_iterations", _SUBAGENT_DEFAULT_MAX_TURNS)
-
-        state = TurnState()
-
-        while max_turns is None or state.turn_count < max_turns:
-            if tool_module.is_cancelled():
-                return ("Interrupted.", "interrupted")
-
-            loop_msgs = messages[initial_msg_count:]
-            if len(loop_msgs) > max_loop_pairs * 2:
-                excess = len(loop_msgs) - max_loop_pairs * 2
-                trim = excess + (excess % 2)
-                messages = messages[:initial_msg_count] + loop_msgs[trim:]
-
-            create_kwargs = dict(
-                model=self._active_model,
-                max_tokens=max_tokens,
-                system=cached_system,
-                tools=self._build_cached_tools(),
-                messages=messages,
-            )
-            if thinking_budget:
-                create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
-            if stream_idle_timeout:
-                create_kwargs["timeout"] = stream_idle_timeout
-
-            try:
-                stream_ctx = self.client.messages.stream(**create_kwargs)
-            except anthropic_module.BadRequestError as e:
-                if "prompt is too long" in str(e).lower() or getattr(e, "status_code", 0) == 413:
-                    _log(f"[ReactiveCompact] Context too long, compacting and retrying: {e}")
-                    keep_recent = self.config.get("compaction_keep_recent", 10)
-                    summary = self.history.compact(self._summarize_history, keep_recent)
-                    if summary:
-                        raw2 = [{"role": m["role"], "content": m["content"]} for m in self.history.get_recent(ctx) if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
-                        messages = []
-                        for msg in raw2:
-                            if messages and messages[-1]["role"] == msg["role"]:
-                                messages[-1]["content"] += "\n\n" + msg["content"]
-                            else:
-                                messages.append(dict(msg))
-                        while messages and messages[-1]["role"] == "assistant":
-                            messages.pop()
-                        create_kwargs["messages"] = messages
-                        initial_msg_count = len(messages)
-                        stream_ctx = self.client.messages.stream(**create_kwargs)
-                    else:
-                        raise
-                else:
-                    raise
-
-            with stream_ctx as stream:
-                _cur_type = None
-                _cur_chunks: list[str] = []
-
-                for event in stream:
-                    etype = getattr(event, "type", None)
-                    if etype == "content_block_start":
-                        _cur_type = getattr(event.content_block, "type", None)
-                        _cur_chunks = []
-                    elif etype == "content_block_delta":
-                        delta = event.delta
-                        dt = getattr(delta, "type", None)
-                        if dt == "thinking_delta":
-                            _cur_chunks.append(delta.thinking)
-                        elif dt == "text_delta":
-                            _cur_chunks.append(delta.text)
-                    elif etype == "content_block_stop":
-                        body = "".join(_cur_chunks).strip()
-                        if _cur_type == "thinking" and body:
-                            _log(f"[Thinking] {body[:120]}...")
-                            if self.send_update:
-                                self.send_update(f"💭 {body[:200]}{'...' if len(body) > 200 else ''}")
-                        elif _cur_type == "text" and body:
-                            _log(f"[Agent] {body[:120]}")
-                            if self.send_update:
-                                self.send_update(body)
-
-                resp = stream.get_final_message()
-
-            log_tokens(TOKEN_LOG, iterations, resp.stop_reason, resp.usage, messages)
-
-            # Token tracker update
-            self.token_tracker.update(resp.usage)
-
-            # Report token usage to agent registry for coordinator progress view
-            if self._agent_id and resp.usage:
-                agent_registry.record_tokens(
-                    self._agent_id,
-                    input_tokens=resp.usage.input_tokens,
-                    output_tokens=resp.usage.output_tokens,
-                )
-
-            # Warn if approaching context limit
-            if self.token_tracker.should_warn(self._active_model):
-                self.token_tracker._warned = True
-                warn_msg = f"⚠️ {self.token_tracker.status_line(self._active_model)} — will auto-compact soon."
-                _log(f"[Context] {warn_msg}")
-                if self.send_update:
-                    self.send_update(warn_msg)
-
-            # Auto-compact if over threshold
-            if self.token_tracker.should_compact(self._active_model):
-                _log(f"[Compact] Token threshold reached ({self.token_tracker.status_line(self._active_model)}). Auto-compacting.")
-                try:
-                    _prev_source = self.query_source
-                    self.query_source = "compact"
-                    threshold = self.config.get("compaction_threshold_messages", 40)
-                    keep_recent = self.config.get("compaction_keep_recent", 10)
-                    summary = self.history.compact(self._summarize_history, keep_recent)
-                    self.query_source = _prev_source
-                    if summary:
-                        _log(f"[Compact] Done. Summary: {len(summary)} chars.")
-                        self.token_tracker.reset()
-                        # Rebuild message list from compacted history
-                        raw = [
-                            {"role": m["role"], "content": m["content"]}
-                            for m in self.history.get_recent(self.config.get("max_context_messages", 20))
-                            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
-                        ]
-                        messages = []
-                        for msg in raw:
-                            if messages and messages[-1]["role"] == msg["role"]:
-                                messages[-1]["content"] += "\n\n" + msg["content"]
-                            else:
-                                messages.append(dict(msg))
-                        initial_msg_count = len(messages)
-                except Exception as e:
-                    self.query_source = _prev_source
-                    _log(f"[Compact] Failed: {e}")
-                    self.token_tracker.record_failure()
-                    if self.token_tracker.circuit_open:
-                        _log("[Compact] Circuit open — compaction disabled for this session.")
-
-            if resp.stop_reason == "end_turn":
-                parts = [b.text for b in resp.content if hasattr(b, "text") and b.type == "text"]
-                return ("\n".join(parts).strip(), "end_turn")
-
-            if resp.stop_reason == "tool_use":
-                new_turn = state.turn_count + 1
-                assistant_content = []
-                tool_calls_to_exec = []
-
-                for block in resp.content:
-                    if block.type == "thinking":
-                        assistant_content.append({"type": "thinking", "thinking": block.thinking, "signature": block.signature})
-                    elif block.type == "text":
-                        assistant_content.append({"type": "text", "text": block.text})
-                    elif block.type == "tool_use":
-                        assistant_content.append({
-                            "type": "tool_use",
-                            "id": block.id,
-                            "name": block.name,
-                            "input": block.input,
-                        })
-                        _log(f"[Tool {new_turn}/{'∞' if max_turns is None else max_turns}|{self.query_source}] {block.name}({json.dumps(block.input)[:120]})")
-                        tool_calls_to_exec.append(block)
-
-                tool_results = []
-                _aid = self._agent_id or ""
-                if len(tool_calls_to_exec) > 1:
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        futures = {
-                            executor.submit(tool_module.execute, blk.name, blk.input, self.send_update, permission_fn, _aid): blk
-                            for blk in tool_calls_to_exec
-                        }
-                        results_map = {}
-                        for future, blk in futures.items():
-                            results_map[blk.id] = self._cap_tool_result(str(future.result()))
-                    for blk in tool_calls_to_exec:
-                        result = results_map[blk.id]
-                        _log(f"[Result] {result[:200]}")
-                        tool_results.append({"type": "tool_result", "tool_use_id": blk.id, "content": result})
-                else:
-                    for blk in tool_calls_to_exec:
-                        result = self._cap_tool_result(str(tool_module.execute(blk.name, blk.input, self.send_update, permission_fn, _aid)))
-                        _log(f"[Result] {result[:200]}")
-                        tool_results.append({"type": "tool_result", "tool_use_id": blk.id, "content": result})
-
-                messages.append({"role": "assistant", "content": assistant_content})
-
-                nudges = []
-                tools_this_iter = sum(1 for b in assistant_content if b["type"] == "tool_use")
-                if tools_this_iter == 1:
-                    nudges.append("[SYSTEM] You called 1 tool. What else could you call in parallel right now? Aim for 3+ tools per iteration.")
-
-                remaining = None if max_turns is None else max_turns - new_turn
-                if remaining is not None and remaining <= 10:
-                    nudges.append(
-                        f"[SYSTEM] {new_turn}/{max_turns} iterations used, {remaining} remaining. "
-                        f"Batch all remaining tool calls — no single-tool responses."
-                    )
-
-                if nudges and tool_results:
-                    last = tool_results[-1]
-                    existing = last.get("content", "")
-                    tool_results[-1] = {**last, "content": existing + "\n\n" + "\n".join(nudges)}
-
-                # Report tool use to registry (progress tracking for coordinator view)
-                if self._agent_id:
-                    for blk in tool_calls_to_exec:
-                        agent_registry.record_tool(self._agent_id, blk.name)
-
-                messages.append({"role": "user", "content": tool_results})
-
-                # --- Multi-agent: check for abort signal from coordinator ---
-                if self._agent_id and agent_registry.is_aborted(self._agent_id):
-                    return ("[Agent stopped by coordinator.]", "aborted")
-
-                # --- Multi-agent: drain pending messages from coordinator ---
-                if self._agent_id:
-                    pending = agent_registry.drain_messages(self._agent_id)
-                    for msg in pending:
-                        _log(f"[Agent] Received coordinator message: {msg[:80]}")
-                        messages.append({
-                            "role": "user",
-                            "content": f"[Message from coordinator]: {msg}",
-                        })
-
-                call_sig = "|".join(
-                    f"{b['name']}:{json.dumps(b['input'], sort_keys=True)}"
-                    for b in assistant_content if b["type"] == "tool_use"
-                )
-                new_last3 = (state.last3_calls + (call_sig,))[-3:]
-                state = _dc_replace(state, turn_count=new_turn, last3_calls=new_last3)
-
-                if len(state.last3_calls) == 3 and len(set(state.last3_calls)) == 1:
-                    return (
-                        "Stuck in a loop — same tool call repeated 3 times. Stop and tell the user what you tried and what failed.",
-                        "stuck",
-                    )
-
-            else:
-                return (f"Unexpected stop reason: {resp.stop_reason}", "error")
-
-        return ("Still working — hit iteration limit, resuming automatically...", "max_turns")
+        return self._agent_loop(
+            AnthropicAdapter(self.config, send_update=self.send_update), permission_fn
+        )
 
     # ------------------------------------------------------------------
     # OpenAI Chat Completions loop
     # ------------------------------------------------------------------
 
     def _openai_loop(self, permission_fn=None) -> tuple[str, str]:
-        ctx = self.config.get("max_context_messages", 20)
-
-        def _rebuild_messages() -> list:
-            # Use _build_system_text() so MiniMax/OpenAI gets the same context injection
-            # (persistent memory, planning mode, agent type) as the Anthropic loop.
-            msgs = [{"role": "system", "content": self._build_system_text()}]
-            for m in self.history.get_recent(ctx):
-                if isinstance(m.get("content"), str):
-                    msgs.append({"role": m["role"], "content": m["content"]})
-            return msgs
-
-        messages = _rebuild_messages()
-
-        # Respect planning mode and agent-type tool restrictions (same as Anthropic loop)
-        openai_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["input_schema"],
-                },
-            }
-            for t in self._build_cached_tools()
-        ]
-
-        iterations = 0
-        state = TurnState()
-        if self._agent_id is None:
-            max_turns = self.config.get("max_iterations")
-        else:
-            max_turns = self._max_turns or self.config.get("max_iterations", _SUBAGENT_DEFAULT_MAX_TURNS)
-
-        thinking_budget = self.config.get("thinking_budget", 0)
-        thinking_kwargs = get_thinking_kwargs(self.provider, self._active_model, self._base_url, thinking_budget)
-        strip_thinking = should_strip_thinking_from_history(self.provider, self._active_model, self._base_url)
-        _thinking_unsupported = False  # set True after a 400 on thinking kwargs
-
-        while max_turns is None or iterations < max_turns:
-            if tool_module.is_cancelled():
-                return ("Interrupted.", "interrupted")
-
-            messages = self._prune_old_context_openai(messages)
-
-            create_kwargs = dict(
-                model=self._active_model,
-                messages=messages,
-                tools=openai_tools,
-                tool_choice="required" if iterations == 0 else "auto",
-            )
-            if thinking_kwargs and not _thinking_unsupported:
-                create_kwargs.update(thinking_kwargs)
-
-            def _oai_create(kwargs):
-                """Run create() with graceful fallbacks for thinking params and context length."""
-                nonlocal _thinking_unsupported
-                try:
-                    return self.client.chat.completions.create(**kwargs)
-                except Exception as e:
-                    err = str(e)
-                    # Thinking param rejected — disable and retry
-                    if thinking_kwargs and not _thinking_unsupported and (
-                        "unknown_parameter" in err or "unknown field" in err.lower()
-                    ):
-                        _log(f"[Thinking] Provider rejected thinking param, disabling: {err[:120]}")
-                        _thinking_unsupported = True
-                        kwargs.pop("extra_body", None)
-                        kwargs.pop("reasoning_effort", None)
-                        return self.client.chat.completions.create(**kwargs)
-                    # Context too long — reactive compact then retry
-                    if "context_length_exceeded" in err or "maximum context length" in err.lower() or "413" in err:
-                        _log(f"[ReactiveCompact] Context too long, compacting and retrying: {err[:120]}")
-                        keep_recent = self.config.get("compaction_keep_recent", 10)
-                        summary = self.history.compact(self._summarize_history, keep_recent)
-                        if summary:
-                            kwargs["messages"] = _rebuild_messages()
-                            return self.client.chat.completions.create(**kwargs)
-                    raise
-
-            resp = _oai_create(create_kwargs)
-
-            msg = resp.choices[0].message
-
-            # Token tracking
-            self.token_tracker.update(resp.usage)
-            if self._agent_id and resp.usage:
-                agent_registry.record_tokens(
-                    self._agent_id,
-                    input_tokens=getattr(resp.usage, "prompt_tokens", 0) or 0,
-                    output_tokens=getattr(resp.usage, "completion_tokens", 0) or 0,
-                )
-
-            # Extract thinking content (provider-specific)
-            thinking_text, answer_text = extract_thinking(
-                msg, self.provider, self._active_model, self._base_url
-            )
-            if thinking_text:
-                _log(f"[Thinking] {thinking_text[:120]}...")
-                if self.send_update:
-                    self.send_update(f"💭 {thinking_text[:200]}{'...' if len(thinking_text) > 200 else ''}")
-
-            # Warn if approaching context limit
-            if self.token_tracker.should_warn(self._active_model):
-                self.token_tracker._warned = True
-                warn_msg = f"⚠️ {self.token_tracker.status_line(self._active_model)} — will auto-compact soon."
-                _log(f"[Context] {warn_msg}")
-                if self.send_update:
-                    self.send_update(warn_msg)
-
-            # Auto-compact if over threshold
-            if self.token_tracker.should_compact(self._active_model):
-                _log(f"[Compact] Token threshold reached ({self.token_tracker.status_line(self._active_model)}). Auto-compacting.")
-                try:
-                    _prev_source = self.query_source
-                    self.query_source = "compact"
-                    keep_recent = self.config.get("compaction_keep_recent", 10)
-                    summary = self.history.compact(self._summarize_history, keep_recent)
-                    self.query_source = _prev_source
-                    if summary:
-                        _log(f"[Compact] Done. Summary: {len(summary)} chars.")
-                        self.token_tracker.reset()
-                        messages = _rebuild_messages()
-                except Exception as e:
-                    self.query_source = _prev_source
-                    _log(f"[Compact] Failed: {e}")
-                    self.token_tracker.record_failure()
-                    if self.token_tracker.circuit_open:
-                        _log("[Compact] Circuit open — compaction disabled for this session.")
-
-            if not msg.tool_calls:
-                return (answer_text, "end_turn")
-
-            new_turn = iterations + 1
-            # For providers where reasoning_content must NOT be passed back (e.g. DeepSeek),
-            # strip it from the message before appending to the in-loop history.
-            if strip_thinking and thinking_text:
-                import copy
-                msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
-                msg_dict.pop("reasoning_content", None)
-                messages.append(msg_dict)
-            else:
-                messages.append(msg)
-            tool_results = []
-            _aid = self._agent_id or ""
-            _max_str = '∞' if max_turns is None else max_turns
-
-            def _exec_oai_call(call):
-                fn = call.function
-                inputs = json.loads(fn.arguments)
-                _log(f"[Tool {new_turn}/{_max_str}|{self.query_source}] {fn.name}({str(inputs)[:120]})")
-                result = self._cap_tool_result(str(tool_module.execute(fn.name, inputs, self.send_update, permission_fn, _aid)))
-                _log(f"[Result] {result[:200]}")
-                if self._agent_id:
-                    agent_registry.record_tool(self._agent_id, fn.name)
-                return call.id, result
-
-            if len(msg.tool_calls) > 1:
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    futures = {executor.submit(_exec_oai_call, call): call for call in msg.tool_calls}
-                    results_map = {call_id: res for future in futures for call_id, res in [future.result()]}
-                for call in msg.tool_calls:
-                    tool_results.append({"role": "tool", "tool_call_id": call.id, "content": results_map[call.id]})
-            else:
-                call_id, result = _exec_oai_call(msg.tool_calls[0])
-                tool_results.append({"role": "tool", "tool_call_id": call_id, "content": result})
-
-            # Nudge messages injected into last tool result
-            nudges = []
-            if len(msg.tool_calls) == 1:
-                nudges.append("[SYSTEM] You called 1 tool. What else could you call in parallel right now? Aim for 3+ tools per iteration.")
-            remaining = None if max_turns is None else max_turns - new_turn
-            if remaining is not None and remaining <= 10:
-                nudges.append(
-                    f"[SYSTEM] {new_turn}/{max_turns} iterations used, {remaining} remaining. "
-                    f"Batch all remaining tool calls — no single-tool responses."
-                )
-            if nudges and tool_results:
-                last = tool_results[-1]
-                tool_results[-1] = {**last, "content": last["content"] + "\n\n" + "\n".join(nudges)}
-
-            messages.extend(tool_results)
-
-            # Stuck-loop detection
-            call_sig = "|".join(
-                f"{c.function.name}:{c.function.arguments}"
-                for c in msg.tool_calls
-            )
-            new_last3 = (state.last3_calls + (call_sig,))[-3:]
-            state = _dc_replace(state, turn_count=new_turn, last3_calls=new_last3)
-            if len(state.last3_calls) == 3 and len(set(state.last3_calls)) == 1:
-                return (
-                    "Stuck in a loop — same tool call repeated 3 times. Stop and tell the user what you tried and what failed.",
-                    "stuck",
-                )
-
-            # Coordinator abort / message drain
-            if self._agent_id and agent_registry.is_aborted(self._agent_id):
-                return ("[Agent stopped by coordinator.]", "aborted")
-            if self._agent_id:
-                for coord_msg in agent_registry.drain_messages(self._agent_id):
-                    _log(f"[Agent] Received coordinator message: {coord_msg[:80]}")
-                    messages.append({"role": "user", "content": f"[Message from coordinator]: {coord_msg}"})
-
-            iterations = new_turn
-
-        return ("Still working — hit iteration limit, resuming automatically...", "max_turns")
+        return self._agent_loop(
+            OpenAIAdapter(self.config, self.provider, self._active_model, self._base_url, send_update=self.send_update),
+            permission_fn,
+        )
 
     # ------------------------------------------------------------------
     # OpenAI Responses API loop
